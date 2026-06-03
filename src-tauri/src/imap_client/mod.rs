@@ -1,0 +1,167 @@
+use crate::oauth::{build_xoauth2_string, ensure_oauth_email, refresh_access_token, OAuthProvider};
+use crate::secure;
+use futures::StreamExt;
+
+type TlsStream = tokio_native_tls::TlsStream<tokio::net::TcpStream>;
+pub type ImapSession = async_imap::Session<TlsStream>;
+
+const UID_FETCH_QUERIES: &[&str] = &["(BODY.PEEK[])", "RFC822"];
+
+pub async fn fetch_uid_message_raw(session: &mut ImapSession, uid: u32) -> Result<Vec<u8>, String> {
+    let uid_set = uid.to_string();
+    for query in UID_FETCH_QUERIES {
+        let fetches = session
+            .uid_fetch(&uid_set, query)
+            .await
+            .map_err(|e| format!("UID FETCH {uid_set} {query} failed: {:?}", e))?;
+        let collected: Vec<_> = fetches.collect().await;
+        for fetch_result in collected {
+            let fetch = fetch_result.map_err(|e| format!("FETCH stream error: {:?}", e))?;
+            if let Some(raw) = fetch.body() {
+                if !raw.is_empty() {
+                    return Ok(raw.to_vec());
+                }
+            }
+        }
+    }
+    Err(format!("No message body returned for IMAP UID {uid}"))
+}
+
+pub struct ImapConnection;
+
+impl ImapConnection {
+    pub async fn connect_oauth(
+        account_id: i64,
+        provider: &OAuthProvider,
+        email: &str,
+    ) -> Result<ImapSession, String> {
+        let email = ensure_oauth_email(account_id, provider, email).await?;
+        let access_token = secure::get_access_token(account_id)?;
+
+        let session = Self::connect_and_auth_oauth(provider, &email, &access_token).await;
+
+        match session {
+            Ok(s) => Ok(s),
+            Err(_) => {
+                log::warn!("XOAUTH2 login failed, attempting token refresh");
+                let refresh_token = secure::get_refresh_token(account_id)?;
+                let new_tokens = refresh_access_token(provider, &refresh_token).await?;
+                secure::store_access_token(account_id, &new_tokens.access_token)?;
+
+                Self::connect_and_auth_oauth(provider, &email, &new_tokens.access_token).await
+            }
+        }
+    }
+
+    async fn connect_and_auth_oauth(
+        provider: &OAuthProvider,
+        email: &str,
+        access_token: &str,
+    ) -> Result<ImapSession, String> {
+        let tls = Self::make_tls_connector()?;
+        let tcp_stream = tokio::net::TcpStream::connect(format!(
+            "{}:{}",
+            provider.imap_host(),
+            provider.imap_port()
+        ))
+        .await
+        .map_err(|e| format!("IMAP TCP connect failed: {}", e))?;
+
+        let tls_stream = tls
+            .connect(provider.imap_host(), tcp_stream)
+            .await
+            .map_err(|e| format!("IMAP TLS handshake failed: {}", e))?;
+
+        let mut client = async_imap::Client::new(tls_stream);
+
+        let _greeting = client
+            .read_response()
+            .await
+            .map_err(|e| format!("IMAP read greeting failed: {}", e))?;
+
+        let auth_string = build_xoauth2_string(email, access_token);
+        let auth = XOAuth2Auth { string: auth_string };
+
+        client
+            .authenticate("XOAUTH2", auth)
+            .await
+            .map_err(|(e, _)| format!("IMAP XOAUTH2 auth failed: {:?}", e))
+    }
+
+    pub async fn connect_plain(
+        account_id: i64,
+        host: &str,
+        port: i64,
+        encryption: &str,
+        username: &str,
+    ) -> Result<ImapSession, String> {
+        let password = secure::get_imap_password(account_id)?;
+        let addr = format!("{}:{}", host, port);
+        let tls = Self::make_tls_connector()?;
+
+        match encryption {
+            "SSL" => {
+                let tcp_stream = tokio::net::TcpStream::connect(&addr)
+                    .await
+                    .map_err(|e| format!("IMAP TCP connect to {} failed: {}", addr, e))?;
+                let tls_stream = tls
+                    .connect(host, tcp_stream)
+                    .await
+                    .map_err(|e| format!("IMAP TLS failed: {}", e))?;
+                let mut client = async_imap::Client::new(tls_stream);
+                let _greeting = client
+                    .read_response()
+                    .await
+                    .map_err(|e| format!("IMAP read greeting failed: {}", e))?;
+                client
+                    .login(username, &password)
+                    .await
+                    .map_err(|(e, _)| format!("IMAP login failed: {}", e))
+            }
+            "STARTTLS" => {
+                let tcp_stream = tokio::net::TcpStream::connect(&addr)
+                    .await
+                    .map_err(|e| format!("IMAP TCP connect to {} failed: {}", addr, e))?;
+                let mut client = async_imap::Client::new(tcp_stream);
+                let _greeting = client
+                    .read_response()
+                    .await
+                    .map_err(|e| format!("IMAP read greeting failed: {}", e))?;
+                client
+                    .run_command_and_check_ok("STARTTLS", None)
+                    .await
+                    .map_err(|e| format!("STARTTLS command failed: {}", e))?;
+                let inner_stream = client.into_inner();
+                let tls_stream = tls
+                    .connect(host, inner_stream)
+                    .await
+                    .map_err(|e| format!("STARTTLS handshake failed: {}", e))?;
+                let tls_client = async_imap::Client::new(tls_stream);
+                tls_client
+                    .login(username, &password)
+                    .await
+                    .map_err(|(e, _)| format!("IMAP login failed: {:?}", e))
+            }
+            _ => Err(format!("Unknown encryption type: {}", encryption)),
+        }
+    }
+
+    fn make_tls_connector() -> Result<tokio_native_tls::TlsConnector, String> {
+        let connector = native_tls::TlsConnector::builder()
+            .build()
+            .map_err(|e| format!("TLS connector build failed: {}", e))?;
+        Ok(tokio_native_tls::TlsConnector::from(connector))
+    }
+}
+
+struct XOAuth2Auth {
+    string: String,
+}
+
+impl async_imap::Authenticator for XOAuth2Auth {
+    type Response = String;
+
+    fn process(&mut self, _data: &[u8]) -> Self::Response {
+        self.string.clone()
+    }
+}

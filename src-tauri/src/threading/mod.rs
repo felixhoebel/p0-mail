@@ -1,0 +1,220 @@
+use crate::db;
+use crate::email_parse;
+use std::collections::{HashMap, HashSet};
+
+struct RawEmail {
+    id: i64,
+    message_id: String,
+    in_reply_to: Option<String>,
+    references: Option<Vec<String>>,
+    subject: Option<String>,
+    received_at: i64,
+    is_read: bool,
+}
+
+pub struct ThreadingService;
+
+impl ThreadingService {
+    pub fn new() -> Self {
+        ThreadingService
+    }
+
+    pub fn rebuild_threads_for_account(&self, account_id: i64) -> Result<(), String> {
+        let emails = self.fetch_unthreaded_emails(account_id)?;
+
+        let threads = self.build_threads(&emails);
+
+        self.persist_threads(account_id, &threads, &emails)?;
+
+        Ok(())
+    }
+
+    fn fetch_unthreaded_emails(&self, account_id: i64) -> Result<Vec<RawEmail>, String> {
+        let conn = db::get()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, message_id, in_reply_to, \"references\", subject, received_at, is_read \
+                 FROM emails WHERE account_id = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let emails: Vec<RawEmail> = stmt
+            .query_map(rusqlite::params![account_id], |row| {
+                let refs_str: Option<String> = row.get(3)?;
+                let refs: Option<Vec<String>> = refs_str
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok());
+                Ok(RawEmail {
+                    id: row.get(0)?,
+                    message_id: row.get(1)?,
+                    in_reply_to: row.get(2)?,
+                    references: refs,
+                    subject: row.get(4)?,
+                    received_at: row.get(5)?,
+                    is_read: row.get::<_, i64>(6)? != 0,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(emails)
+    }
+
+    fn build_threads(&self, emails: &[RawEmail]) -> Vec<Vec<i64>> {
+        let mut msg_id_to_idx: HashMap<String, usize> = HashMap::new();
+        for (idx, email) in emails.iter().enumerate() {
+            msg_id_to_idx.insert(email.message_id.clone(), idx);
+        }
+
+        let mut parent: Vec<Option<usize>> = vec![None; emails.len()];
+
+        for (idx, email) in emails.iter().enumerate() {
+            let parent_idx = self.find_parent(email, &msg_id_to_idx);
+            if let Some(pi) = parent_idx {
+                if pi != idx && !self.would_cycle(idx, pi, &parent) {
+                    parent[idx] = Some(pi);
+                }
+            }
+        }
+
+        let mut roots: HashSet<usize> = HashSet::new();
+        for i in 0..emails.len() {
+            roots.insert(i);
+        }
+        for i in 0..emails.len() {
+            if parent[i].is_some() {
+                roots.remove(&i);
+            }
+        }
+
+        let mut threads: Vec<Vec<i64>> = Vec::new();
+        for &root in &roots {
+            let mut thread: Vec<i64> = Vec::new();
+            self.collect_thread(root, &parent, emails, &mut thread);
+            thread.sort_by_key(|&i| emails[i as usize].received_at);
+            threads.push(thread);
+        }
+
+        threads
+    }
+
+    fn find_parent(
+        &self,
+        email: &RawEmail,
+        msg_id_to_idx: &HashMap<String, usize>,
+    ) -> Option<usize> {
+        if let Some(ref refs) = email.references {
+            if let Some(last_ref) = refs.last() {
+                if let Some(&idx) = msg_id_to_idx.get(last_ref) {
+                    return Some(idx);
+                }
+            }
+        }
+
+        if let Some(ref irt) = email.in_reply_to {
+            if let Some(&idx) = msg_id_to_idx.get(irt) {
+                return Some(idx);
+            }
+        }
+
+        None
+    }
+
+    fn would_cycle(&self, child: usize, proposed_parent: usize, parent: &[Option<usize>]) -> bool {
+        let mut current = proposed_parent;
+        loop {
+            if current == child {
+                return true;
+            }
+            match parent[current] {
+                Some(p) => current = p,
+                None => return false,
+            }
+        }
+    }
+
+    fn collect_thread(
+        &self,
+        node: usize,
+        parent: &[Option<usize>],
+        emails: &[RawEmail],
+        thread: &mut Vec<i64>,
+    ) {
+        thread.push(node as i64);
+        for i in 0..emails.len() {
+            if parent[i] == Some(node) {
+                self.collect_thread(i, parent, emails, thread);
+            }
+        }
+    }
+
+    fn persist_threads(
+        &self,
+        account_id: i64,
+        threads: &[Vec<i64>],
+        emails: &[RawEmail],
+    ) -> Result<(), String> {
+        let conn = db::get()?;
+
+        conn.execute(
+            "UPDATE emails SET thread_id = NULL WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        conn.execute(
+            "DELETE FROM threads WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        for thread_indices in threads {
+            if thread_indices.is_empty() {
+                continue;
+            }
+
+            let subject = emails[thread_indices[0] as usize]
+                .subject
+                .as_ref()
+                .map(|s| email_parse::decode_header(s))
+                .unwrap_or_default();
+
+            let latest_date = thread_indices
+                .iter()
+                .map(|&i| emails[i as usize].received_at)
+                .max()
+                .unwrap_or(0);
+
+            let message_count = thread_indices.len() as i64;
+
+            let is_read = thread_indices.iter().all(|&i| emails[i as usize].is_read);
+
+            conn.execute(
+                "INSERT INTO threads (account_id, subject, latest_date, message_count, is_read) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    account_id,
+                    subject,
+                    latest_date,
+                    message_count,
+                    is_read as i64,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+
+            let thread_id = conn.last_insert_rowid();
+
+            for &idx in thread_indices {
+                let email_id = emails[idx as usize].id;
+                conn.execute(
+                    "UPDATE emails SET thread_id = ?1 WHERE id = ?2",
+                    rusqlite::params![thread_id, email_id],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+
+        Ok(())
+    }
+}
