@@ -25,6 +25,7 @@ pub struct Thread {
     pub latest_date: i64,
     pub message_count: i64,
     pub is_read: bool,
+    pub is_flagged: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -66,6 +67,7 @@ pub struct Email {
     pub body_html: Option<String>,
     pub is_read: bool,
     pub folder: String,
+    pub labels: Vec<String>,
     pub attachments_meta: Option<Vec<AttachmentMeta>>,
 }
 
@@ -95,4 +97,6 @@ pub struct AiConfig {
     pub api_key: String,
     pub model: String,
     pub default_tone: String,
+    pub output_language: String,
+    pub custom_instructions: String,
 }

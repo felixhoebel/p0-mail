@@ -53,6 +53,11 @@ fn run_migrations(conn: &Connection) -> SqlResult<()> {
             "thread_id_nullable",
             include_str!("../../migrations/003_thread_id_nullable.sql"),
         ),
+        (
+            4,
+            "labels",
+            include_str!("../../migrations/004_labels.sql"),
+        ),
     ];
 
     for (id, name, sql) in migrations {

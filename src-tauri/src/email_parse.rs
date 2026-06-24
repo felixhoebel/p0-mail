@@ -83,6 +83,51 @@ pub fn apply_raw_message(email_id: i64, raw: &[u8]) -> Result<(), String> {
     }
 }
 
+pub fn strip_html_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut chars = html.chars().peekable();
+    let mut in_tag = false;
+    let mut tag_buf = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            in_tag = true;
+            tag_buf.clear();
+            tag_buf.push(ch);
+            continue;
+        }
+        if in_tag {
+            tag_buf.push(ch);
+            if ch == '>' {
+                in_tag = false;
+                let tag_lower = tag_buf.to_lowercase();
+                if tag_lower.starts_with("</p")
+                    || tag_lower.starts_with("</div")
+                    || tag_lower.starts_with("</h")
+                    || tag_lower.starts_with("<br")
+                    || tag_lower.starts_with("</li")
+                {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    let decoded = out
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    decoded
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

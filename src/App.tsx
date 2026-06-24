@@ -1,20 +1,33 @@
 import { Routes, Route, Link, useLocation } from "react-router-dom";
+import { Mail, Settings } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import InboxPage from "@/pages/InboxPage";
 import SettingsPage from "@/pages/SettingsPage";
 
-function NavItem({ to, label }: { to: string; label: string }) {
+function NavItem({
+  to,
+  label,
+  icon: Icon,
+}: {
+  to: string;
+  label: string;
+  icon: LucideIcon;
+}) {
   const location = useLocation();
   const active = location.pathname === to;
   return (
     <Link
       to={to}
-      className={`flex items-center gap-2 rounded-md px-3 py-2 text-sm ${
+      title={label}
+      aria-label={label}
+      aria-current={active ? "page" : undefined}
+      className={`flex items-center justify-center rounded-md p-2.5 ${
         active
-          ? "bg-accent text-accent-foreground font-medium"
-          : "hover:bg-accent hover:text-accent-foreground"
+          ? "bg-accent text-accent-foreground"
+          : "text-muted-foreground hover:bg-accent hover:text-accent-foreground"
       }`}
     >
-      {label}
+      <Icon className="h-5 w-5" strokeWidth={1.75} />
     </Link>
   );
 }
@@ -22,13 +35,13 @@ function NavItem({ to, label }: { to: string; label: string }) {
 function App() {
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">
-      <aside className="w-56 shrink-0 border-r border-border bg-card flex flex-col">
-        <div className="p-4 border-b border-border">
-          <h1 className="text-lg font-bold tracking-tight">p0mail</h1>
+      <aside className="w-14 shrink-0 border-r border-border bg-card flex flex-col items-center">
+        <div className="h-12 flex items-center justify-center border-b border-border w-full">
+          <span className="text-sm font-bold tracking-tight">p0</span>
         </div>
-        <nav className="flex-1 p-2 space-y-1">
-          <NavItem to="/" label="Inbox" />
-          <NavItem to="/settings" label="Settings" />
+        <nav className="flex-1 flex flex-col items-center gap-1 p-2 w-full">
+          <NavItem to="/" label="Inbox" icon={Mail} />
+          <NavItem to="/settings" label="Settings" icon={Settings} />
         </nav>
       </aside>
       <main className="flex-1 overflow-hidden">

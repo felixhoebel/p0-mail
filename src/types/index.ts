@@ -2,6 +2,7 @@ export type ProviderType = "gmail_oauth" | "microsoft_oauth" | "imap";
 export type EncryptionType = "SSL" | "STARTTLS";
 export type SendStatus = "pending" | "sent" | "failed";
 export type AiTone = "Professional" | "Friendly" | "Concise";
+export type AiOutputLanguage = "de" | "en" | "no";
 
 export interface Account {
   id: number;
@@ -26,6 +27,7 @@ export interface Thread {
   latest_date: number;
   message_count: number;
   is_read: boolean;
+  is_flagged: boolean;
 }
 
 export interface EmailAddress {
@@ -59,6 +61,7 @@ export interface Email {
   body_html: string | null;
   is_read: boolean;
   folder: string;
+  labels: string[];
   attachments_meta: AttachmentMeta[] | null;
 }
 
@@ -83,4 +86,16 @@ export interface AiConfig {
   api_key: string;
   model: string;
   default_tone: AiTone;
+  output_language: AiOutputLanguage;
+  custom_instructions: string;
 }
+
+export type AiStreamTokenKind = "content" | "thinking";
+
+export interface AiStreamEvent {
+  streamId: string;
+  token: string;
+  tokenKind: AiStreamTokenKind;
+  done: boolean;
+}
+

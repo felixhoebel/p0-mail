@@ -1,10 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Account,
   Thread,
   Email,
   SendQueueItem,
   AiConfig,
+  AiStreamEvent,
   ProviderType,
   EncryptionType,
   AiTone,
@@ -147,18 +149,57 @@ export async function validateAiEndpoint(): Promise<boolean> {
   return invoke("validate_ai_endpoint");
 }
 
-export async function summarizeThread(
+export async function streamSummarizeThread(
+  streamId: string,
   threadId: number,
+  emailIds: number[],
   tone: AiTone,
-): Promise<string> {
-  return invoke("summarize_thread", { threadId, tone });
+): Promise<void> {
+  return invoke("stream_summarize_thread", { streamId, threadId, emailIds, tone });
 }
 
-export async function draftReply(
+export async function streamDraftReply(
+  streamId: string,
   threadId: number,
+  emailIds: number[],
   tone: AiTone,
-): Promise<string> {
-  return invoke("draft_reply", { threadId, tone });
+): Promise<void> {
+  return invoke("stream_draft_reply", { streamId, threadId, emailIds, tone });
+}
+
+export async function streamPolishCompose(
+  streamId: string,
+  subject: string,
+  draft: string,
+  tone: AiTone,
+): Promise<void> {
+  return invoke("stream_polish_compose", { streamId, subject, draft, tone });
+}
+
+function normalizeAiStreamEvent(raw: Record<string, unknown>): AiStreamEvent {
+  const kind = raw.tokenKind ?? raw.token_kind ?? "content";
+  return {
+    streamId: String(raw.streamId ?? raw.stream_id ?? ""),
+    token: String(raw.token ?? ""),
+    tokenKind: kind === "thinking" ? "thinking" : "content",
+    done: Boolean(raw.done),
+  };
+}
+
+export function onAiStream(
+  callback: (event: AiStreamEvent) => void,
+): Promise<UnlistenFn> {
+  return listen("ai-stream", (e) =>
+    callback(normalizeAiStreamEvent(e.payload as Record<string, unknown>)),
+  );
+}
+
+export function onAiStreamError(
+  callback: (event: AiStreamEvent) => void,
+): Promise<UnlistenFn> {
+  return listen("ai-stream-error", (e) =>
+    callback(normalizeAiStreamEvent(e.payload as Record<string, unknown>)),
+  );
 }
 
 // Connectivity

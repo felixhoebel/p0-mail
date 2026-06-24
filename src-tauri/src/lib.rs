@@ -236,10 +236,10 @@ fn list_threads(
     let offset = offset.unwrap_or(0);
 
     let sql = match account_id {
-        Some(_) => "SELECT id, account_id, subject, latest_date, message_count, is_read \
+        Some(_) => "SELECT id, account_id, subject, latest_date, message_count, is_read, is_flagged \
                      FROM threads WHERE account_id = ?1 \
                      ORDER BY latest_date DESC LIMIT ?2 OFFSET ?3",
-        None => "SELECT id, account_id, subject, latest_date, message_count, is_read \
+        None => "SELECT id, account_id, subject, latest_date, message_count, is_read, is_flagged \
                  FROM threads ORDER BY latest_date DESC LIMIT ?1 OFFSET ?2",
     };
 
@@ -255,6 +255,7 @@ fn list_threads(
                     latest_date: row.get(3)?,
                     message_count: row.get(4)?,
                     is_read: row.get::<_, i64>(5)? != 0,
+                    is_flagged: row.get::<_, i64>(6)? != 0,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -269,6 +270,7 @@ fn list_threads(
                     latest_date: row.get(3)?,
                     message_count: row.get(4)?,
                     is_read: row.get::<_, i64>(5)? != 0,
+                    is_flagged: row.get::<_, i64>(6)? != 0,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -287,7 +289,7 @@ fn get_emails(thread_id: i64) -> Result<Vec<models::Email>, String> {
             "SELECT id, thread_id, account_id, imap_uid, message_id, \
              in_reply_to, \"references\", subject, from_json, to_json, \
              cc_json, bcc_json, date_rfc2822, received_at, body_text, \
-             body_html, is_read, folder, attachments_meta \
+             body_html, is_read, folder, attachments_meta, labels \
              FROM emails WHERE thread_id = ?1 ORDER BY received_at ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -303,6 +305,8 @@ fn get_emails(thread_id: i64) -> Result<Vec<models::Email>, String> {
             let cc_str: Option<String> = row.get(10)?;
             let bcc_str: Option<String> = row.get(11)?;
             let att_str: Option<String> = row.get(18)?;
+            let labels_str: String = row.get(19)?;
+            let labels: Vec<String> = serde_json::from_str(&labels_str).unwrap_or_default();
 
             Ok(models::Email {
                 id: row.get(0)?,
@@ -323,6 +327,7 @@ fn get_emails(thread_id: i64) -> Result<Vec<models::Email>, String> {
                 body_html: row.get(15)?,
                 is_read: row.get::<_, i64>(16)? != 0,
                 folder: row.get(17)?,
+                labels,
                 attachments_meta: att_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
             })
         })
@@ -340,7 +345,7 @@ fn get_email(email_id: i64) -> Result<models::Email, String> {
         "SELECT id, thread_id, account_id, imap_uid, message_id, \
          in_reply_to, \"references\", subject, from_json, to_json, \
          cc_json, bcc_json, date_rfc2822, received_at, body_text, \
-         body_html, is_read, folder, attachments_meta \
+         body_html, is_read, folder, attachments_meta, labels \
          FROM emails WHERE id = ?1",
         rusqlite::params![email_id],
         |row| {
@@ -353,6 +358,8 @@ fn get_email(email_id: i64) -> Result<models::Email, String> {
             let cc_str: Option<String> = row.get(10)?;
             let bcc_str: Option<String> = row.get(11)?;
             let att_str: Option<String> = row.get(18)?;
+            let labels_str: String = row.get(19)?;
+            let labels: Vec<String> = serde_json::from_str(&labels_str).unwrap_or_default();
 
             Ok(models::Email {
                 id: row.get(0)?,
@@ -373,6 +380,7 @@ fn get_email(email_id: i64) -> Result<models::Email, String> {
                 body_html: row.get(15)?,
                 is_read: row.get::<_, i64>(16)? != 0,
                 folder: row.get(17)?,
+                labels,
                 attachments_meta: att_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
             })
         },
@@ -393,7 +401,7 @@ fn search_emails(query: String) -> Result<Vec<models::Email>, String> {
         "SELECT id, thread_id, account_id, imap_uid, message_id, \
          in_reply_to, \"references\", subject, from_json, to_json, \
          cc_json, bcc_json, date_rfc2822, received_at, body_text, \
-         body_html, is_read, folder, attachments_meta \
+         body_html, is_read, folder, attachments_meta, labels \
          FROM emails WHERE id IN ({})",
         placeholders.join(",")
     );
@@ -412,6 +420,8 @@ fn search_emails(query: String) -> Result<Vec<models::Email>, String> {
             let cc_str: Option<String> = row.get(10)?;
             let bcc_str: Option<String> = row.get(11)?;
             let att_str: Option<String> = row.get(18)?;
+            let labels_str: String = row.get(19)?;
+            let labels: Vec<String> = serde_json::from_str(&labels_str).unwrap_or_default();
             Ok(models::Email {
                 id: row.get(0)?,
                 thread_id: row.get(1)?,
@@ -431,6 +441,7 @@ fn search_emails(query: String) -> Result<Vec<models::Email>, String> {
                 body_html: row.get(15)?,
                 is_read: row.get::<_, i64>(16)? != 0,
                 folder: row.get(17)?,
+                labels,
                 attachments_meta: att_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
             })
         })
@@ -768,6 +779,20 @@ fn get_ai_config() -> Result<Option<models::AiConfig>, String> {
             |row| row.get(0),
         )
         .ok();
+    let output_language: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'ai_output_language'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    let custom_instructions: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'ai_custom_instructions'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
 
     match base_url {
         Some(bu) if !bu.is_empty() => {
@@ -777,6 +802,8 @@ fn get_ai_config() -> Result<Option<models::AiConfig>, String> {
                 api_key,
                 model: model.unwrap_or_default(),
                 default_tone: default_tone.unwrap_or_else(|| "Professional".to_string()),
+                output_language: output_language.unwrap_or_else(|| "en".to_string()),
+                custom_instructions: custom_instructions.unwrap_or_default(),
             }))
         }
         _ => Ok(None),
@@ -801,6 +828,16 @@ fn set_ai_config(config: models::AiConfig) -> Result<(), String> {
         rusqlite::params![config.default_tone],
     )
     .map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('ai_output_language', ?1)",
+        rusqlite::params![config.output_language],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('ai_custom_instructions', ?1)",
+        rusqlite::params![config.custom_instructions],
+    )
+    .map_err(|e| e.to_string())?;
     secure::store_ai_api_key(&config.api_key)?;
     Ok(())
 }
@@ -818,15 +855,42 @@ async fn validate_ai_endpoint() -> Result<bool, String> {
 }
 
 #[tauri::command]
-async fn summarize_thread(thread_id: i64, tone: String) -> Result<String, String> {
-    let service = ai::AiService::new();
-    service.summarize_thread(thread_id, &tone).await
+async fn stream_summarize_thread(
+    app: tauri::AppHandle,
+    stream_id: String,
+    thread_id: i64,
+    email_ids: Vec<i64>,
+    tone: String,
+) -> Result<(), String> {
+    ai::AiService::new()
+        .stream_summarize_thread(&app, &stream_id, thread_id, &email_ids, &tone)
+        .await
 }
 
 #[tauri::command]
-async fn draft_reply(thread_id: i64, tone: String) -> Result<String, String> {
-    let service = ai::AiService::new();
-    service.draft_reply(thread_id, &tone).await
+async fn stream_draft_reply(
+    app: tauri::AppHandle,
+    stream_id: String,
+    thread_id: i64,
+    email_ids: Vec<i64>,
+    tone: String,
+) -> Result<(), String> {
+    ai::AiService::new()
+        .stream_draft_reply(&app, &stream_id, thread_id, &email_ids, &tone)
+        .await
+}
+
+#[tauri::command]
+async fn stream_polish_compose(
+    app: tauri::AppHandle,
+    stream_id: String,
+    subject: String,
+    draft: String,
+    tone: String,
+) -> Result<(), String> {
+    ai::AiService::new()
+        .stream_polish_compose(&app, &stream_id, &tone, &subject, &draft)
+        .await
 }
 
 #[tauri::command]
@@ -1083,8 +1147,9 @@ pub fn run() {
             get_ai_config,
             set_ai_config,
             validate_ai_endpoint,
-            summarize_thread,
-            draft_reply,
+            stream_summarize_thread,
+            stream_draft_reply,
+            stream_polish_compose,
             is_online,
             validate_imap_connection,
         ])

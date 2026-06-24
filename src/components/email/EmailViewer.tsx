@@ -7,6 +7,39 @@ interface EmailViewerProps {
   email: Email;
 }
 
+function LabelPill({ label }: { label: string }) {
+  if (label === "\\Flagged") {
+    return (
+      <span className="inline-flex items-center gap-0.5 px-1.5 py-0 rounded text-[10px] font-medium bg-yellow-50 text-yellow-700 border border-yellow-200">
+        &#9733; Flagged
+      </span>
+    );
+  }
+  if (label === "\\Answered") {
+    return (
+      <span className="inline-flex items-center px-1.5 py-0 rounded text-[10px] font-medium bg-green-50 text-green-700 border border-green-200">
+        &#8617; Answered
+      </span>
+    );
+  }
+  if (label === "\\Draft") {
+    return (
+      <span className="inline-flex items-center px-1.5 py-0 rounded text-[10px] font-medium bg-gray-50 text-gray-600 border border-gray-200">
+        Draft
+      </span>
+    );
+  }
+  if (label === "\\Deleted" || label.startsWith("\\Seen") || label === "\\Recent" || label === "\\MayCreate") {
+    return null;
+  }
+  if (label.startsWith("\\")) return null;
+  return (
+    <span className="inline-flex items-center px-1.5 py-0 rounded text-[10px] font-medium bg-blue-50 text-blue-700 border border-blue-200">
+      {label}
+    </span>
+  );
+}
+
 const SANITIZE_CONFIG = {
   ALLOWED_TAGS: [
     "a", "b", "br", "blockquote", "code", "div", "em", "h1", "h2", "h3",
@@ -119,7 +152,14 @@ export default function EmailViewer({ email }: EmailViewerProps) {
             </div>
           )}
           <div className="text-xs">{formatDate(email.received_at)}</div>
-        </div>
+        {email.labels.length > 0 && (
+          <div className="flex items-center gap-1 mt-1 flex-wrap">
+            {email.labels.map((label) => (
+              <LabelPill key={label} label={label} />
+            ))}
+          </div>
+        )}
+      </div>
       </div>
       <div className="flex-1 overflow-y-auto px-4 py-3">
         <div

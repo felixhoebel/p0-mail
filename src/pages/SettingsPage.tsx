@@ -18,7 +18,8 @@ import {
   validateAiEndpoint,
   triggerSync,
 } from "@/lib/api";
-import type { Account, AiConfig, EncryptionType } from "@/types";
+import type { Account, AiConfig, AiOutputLanguage, EncryptionType } from "@/types";
+import { AI_OUTPUT_LANGUAGES } from "@/lib/aiUi";
 
 function AccountList({
   accounts,
@@ -289,11 +290,15 @@ function ImapForm({ onAccountAdded }: { onAccountAdded: () => void }) {
   );
 }
 
+const AI_TONES = ["Professional", "Friendly", "Concise"] as const;
+
 function AiConfigSection() {
-  const [config, setConfig] = useState<AiConfig | null>(null);
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState("");
+  const [defaultTone, setDefaultTone] = useState<AiConfig["default_tone"]>("Professional");
+  const [outputLanguage, setOutputLanguage] = useState<AiOutputLanguage>("en");
+  const [customInstructions, setCustomInstructions] = useState("");
   const [apiKeyStored, setApiKeyStored] = useState(false);
   const [saving, setSaving] = useState(false);
   const [validating, setValidating] = useState(false);
@@ -301,9 +306,11 @@ function AiConfigSection() {
 
   const applyConfig = (c: AiConfig | null) => {
     if (!c) return;
-    setConfig(c);
     setBaseUrl(c.base_url);
     setModel(c.model);
+    setDefaultTone(c.default_tone);
+    setOutputLanguage(c.output_language || "en");
+    setCustomInstructions(c.custom_instructions || "");
     if (c.api_key) {
       setApiKey(c.api_key);
       setApiKeyStored(true);
@@ -325,7 +332,9 @@ function AiConfigSection() {
         base_url: baseUrl,
         api_key: apiKey,
         model,
-        default_tone: config?.default_tone || "Professional",
+        default_tone: defaultTone,
+        output_language: outputLanguage,
+        custom_instructions: customInstructions,
       });
       const saved = await getAiConfig();
       applyConfig(saved);
@@ -352,7 +361,10 @@ function AiConfigSection() {
   };
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-4">
+      <p className="text-sm text-muted-foreground leading-relaxed">
+        OpenAI-compatible endpoint for summarizing threads and drafting replies.
+      </p>
       <div>
         <label className="text-sm font-medium">Base URL</label>
         <Input
@@ -379,6 +391,63 @@ function AiConfigSection() {
           value={model}
           onChange={(e) => setModel(e.target.value)}
           placeholder="gpt-4o"
+        />
+      </div>
+      <div>
+        <label className="text-sm font-medium">Default tone</label>
+        <div className="flex flex-wrap gap-2 mt-1.5">
+          {AI_TONES.map((tone) => (
+            <button
+              key={tone}
+              type="button"
+              onClick={() => setDefaultTone(tone)}
+              className={`rounded-full px-3 py-1 text-xs font-medium border transition-colors ${
+                defaultTone === tone
+                  ? "border-violet-500/50 bg-violet-500/15 text-foreground"
+                  : "border-border text-muted-foreground hover:border-violet-500/30 hover:text-foreground"
+              }`}
+            >
+              {tone}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div>
+        <label className="text-sm font-medium">Output language</label>
+        <p className="text-xs text-muted-foreground mt-0.5 mb-1.5">
+          Summaries and reply drafts are written in this language (emails may be in any language).
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {AI_OUTPUT_LANGUAGES.map((lang) => (
+            <button
+              key={lang.id}
+              type="button"
+              onClick={() => setOutputLanguage(lang.id)}
+              className={`rounded-full px-3 py-1 text-xs font-medium border transition-colors ${
+                outputLanguage === lang.id
+                  ? "border-violet-500/50 bg-violet-500/15 text-foreground"
+                  : "border-border text-muted-foreground hover:border-violet-500/30 hover:text-foreground"
+              }`}
+            >
+              {lang.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div>
+        <label className="text-sm font-medium" htmlFor="ai-instructions">
+          Custom instructions
+        </label>
+        <p className="text-xs text-muted-foreground mt-0.5 mb-1.5">
+          Extra guidance for the model on every summary and reply (optional).
+        </p>
+        <textarea
+          id="ai-instructions"
+          value={customInstructions}
+          onChange={(e) => setCustomInstructions(e.target.value)}
+          rows={4}
+          placeholder="e.g. Keep replies short. Use formal Sie in German. Always mention our support email."
+          className="flex w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring resize-y min-h-[88px]"
         />
       </div>
       <div className="flex gap-2">
@@ -434,9 +503,9 @@ export default function SettingsPage() {
         </CardContent>
       </Card>
 
-      <Card>
+      <Card className="border-violet-500/15">
         <CardHeader>
-          <CardTitle>AI Configuration</CardTitle>
+          <CardTitle>AI</CardTitle>
         </CardHeader>
         <CardContent>
           <AiConfigSection />

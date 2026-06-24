@@ -1,4 +1,6 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { Link } from "react-router-dom";
+import { Loader2, Settings } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -17,13 +19,27 @@ import {
   fetchRecentBodies,
   isOnline,
   getAiConfig,
-  summarizeThread,
-  draftReply,
+  streamSummarizeThread,
+  streamDraftReply,
+  onAiStream,
+  onAiStreamError,
 } from "@/lib/api";
 import type { Account, Thread, Email, SendQueueItem, AiConfig, AiTone } from "@/types";
 import EmailViewer from "@/components/email/EmailViewer";
 import ComposeEditor from "@/components/email/ComposeEditor";
+import AiSummaryPanel from "@/components/ai/AiSummaryPanel";
+import AiActionButtons from "@/components/ai/AiActionButtons";
+import AiThinkingStrip from "@/components/ai/AiThinkingStrip";
+import {
+  getAiActionLabels,
+  getAiPanelLabels,
+  getAiThinkingLabels,
+  getComposePolishLabels,
+} from "@/lib/aiUi";
+import { plainTextToHtml } from "@/lib/plainTextToHtml";
 import { getEmails } from "@/lib/api";
+import { useEditor, EditorContent } from "@tiptap/react";
+import StarterKit from "@tiptap/starter-kit";
 
 function formatDate(ts: number): string {
   const d = new Date(ts * 1000);
@@ -45,6 +61,40 @@ function formatAddresses(addrs: { name: string; address: string }[]): string {
   return addrs
     .map((a) => a.name || a.address)
     .join(", ");
+}
+
+function LabelPill({ label }: { label: string }) {
+  if (label === "\\Flagged") {
+    return <span className="text-yellow-500 text-xs" title="Flagged">&#9733;</span>;
+  }
+  if (label === "\\Answered") {
+    return (
+      <span className="inline-flex items-center px-1 py-0 rounded text-[10px] font-medium bg-green-100 text-green-700" title="Answered">
+        &#8617;
+      </span>
+    );
+  }
+  if (label === "\\Draft") {
+    return (
+      <span className="inline-flex items-center px-1.5 py-0 rounded text-[10px] font-medium bg-gray-100 text-gray-600">
+        Draft
+      </span>
+    );
+  }
+  if (label === "\\Deleted") {
+    return null;
+  }
+  if (label.startsWith("\\")) return null;
+  return (
+    <span className="inline-flex items-center px-1.5 py-0 rounded text-[10px] font-medium bg-blue-50 text-blue-700">
+      {label}
+    </span>
+  );
+}
+
+function ThreadLabels({ thread }: { thread: Thread }) {
+  if (!thread.is_flagged) return null;
+  return <LabelPill label="\\Flagged" />;
 }
 
 function SendQueuePanel({ onClose }: { onClose: () => void }) {
@@ -111,6 +161,169 @@ function SendQueuePanel({ onClose }: { onClose: () => void }) {
   );
 }
 
+function InlineReplyEditor({
+  accountId,
+  to,
+  cc,
+  subject,
+  initialBodyHtml,
+  inReplyTo,
+  references,
+  onSend,
+  onCancel,
+  sending,
+  generating,
+  streamingBody,
+  bodyKey,
+}: {
+  accountId: number;
+  to: string;
+  cc: string;
+  subject: string;
+  initialBodyHtml?: string;
+  inReplyTo?: string;
+  references?: string[];
+  onSend: (params: {
+    accountId: number;
+    to: string;
+    cc: string;
+    bcc: string;
+    subject: string;
+    bodyHtml: string;
+    bodyText: string;
+    inReplyTo?: string;
+    references?: string[];
+  }) => void;
+  onCancel: () => void;
+  sending?: boolean;
+  generating?: boolean;
+  streamingBody?: string;
+  bodyKey?: string;
+}) {
+  const [toVal, setToVal] = useState(to);
+  const [ccVal, setCcVal] = useState(cc);
+  const [subjectVal, setSubjectVal] = useState(subject);
+  const [showCc, setShowCc] = useState(!!cc);
+
+  useEffect(() => {
+    setToVal(to);
+    setCcVal(cc);
+    setSubjectVal(subject);
+    setShowCc(!!cc);
+  }, [to, cc, subject]);
+
+  const editor = useEditor(
+    {
+      extensions: [StarterKit],
+      content: initialBodyHtml || "",
+      editorProps: {
+        attributes: {
+          class: "prose prose-sm max-w-none min-h-[120px] focus:outline-none px-3 py-2",
+        },
+      },
+    },
+    [bodyKey],
+  );
+
+  const prevStreamRef = useRef("");
+
+  useEffect(() => {
+    if (editor && streamingBody !== undefined && streamingBody !== prevStreamRef.current) {
+      editor.commands.setContent(plainTextToHtml(streamingBody), { emitUpdate: false });
+      prevStreamRef.current = streamingBody;
+    }
+  }, [editor, streamingBody]);
+
+  useEffect(() => {
+    if (editor && initialBodyHtml && !streamingBody && editor.getText().trim() === "") {
+      editor.commands.setContent(initialBodyHtml, { emitUpdate: false });
+    }
+  }, [editor, initialBodyHtml, streamingBody]);
+
+  const handleSend = useCallback(() => {
+    if (!editor) return;
+    const bodyHtml = editor.getHTML();
+    const bodyText = editor.getText();
+    onSend({
+      accountId,
+      to: toVal,
+      cc: ccVal,
+      bcc: "",
+      subject: subjectVal,
+      bodyHtml,
+      bodyText,
+      inReplyTo,
+      references,
+    });
+  }, [editor, accountId, toVal, ccVal, subjectVal, inReplyTo, references, onSend]);
+
+  return (
+    <div className="border-t border-border bg-background">
+      <div className="px-4 py-2 space-y-1.5 border-b border-border/60">
+        <div className="flex items-center gap-2">
+          <label className="text-xs font-medium w-12 shrink-0">Subject</label>
+          <Input
+            value={subjectVal}
+            onChange={(e) => setSubjectVal(e.target.value)}
+            placeholder="Re: …"
+            className="h-7 text-sm flex-1"
+          />
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="text-xs font-medium w-12 shrink-0">To</label>
+          <Input
+            value={toVal}
+            onChange={(e) => setToVal(e.target.value)}
+            placeholder="recipient@example.com"
+            className="h-7 text-sm flex-1"
+          />
+          <button
+            type="button"
+            onClick={() => setShowCc(!showCc)}
+            className="text-xs text-muted-foreground hover:text-foreground whitespace-nowrap"
+          >
+            {showCc ? "Hide CC" : "CC"}
+          </button>
+        </div>
+        {showCc && (
+          <div className="flex items-center gap-2">
+            <label className="text-xs font-medium w-12 shrink-0">Cc</label>
+            <Input
+              value={ccVal}
+              onChange={(e) => setCcVal(e.target.value)}
+              placeholder="cc@example.com"
+              className="h-7 text-sm"
+            />
+          </div>
+        )}
+      </div>
+      <div className="px-4 pb-2">
+        <div className="relative border border-border rounded-md overflow-hidden min-h-[140px]">
+          {generating && !streamingBody && (
+            <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-background/85 backdrop-blur-[1px]">
+              <Loader2 className="h-5 w-5 animate-spin text-violet-400" />
+              <span className="text-xs text-muted-foreground">Drafting reply…</span>
+            </div>
+          )}
+          <EditorContent editor={editor} />
+        </div>
+      </div>
+      <div className="px-4 pb-3 flex items-center gap-2 justify-end">
+        <Button variant="ghost" size="sm" onClick={onCancel} disabled={sending || generating}>
+          Discard
+        </Button>
+        <Button
+          size="sm"
+          onClick={handleSend}
+          disabled={sending || generating || !toVal || !subjectVal.trim()}
+        >
+          {sending ? "Sending..." : "Send"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export default function InboxPage() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [selectedAccount, setSelectedAccount] = useState<number | null>(null);
@@ -129,8 +342,49 @@ export default function InboxPage() {
   const [pendingQueueCount, setPendingQueueCount] = useState(0);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [aiConfig, setAiConfig] = useState<AiConfig | null>(null);
+
   const [aiSummary, setAiSummary] = useState<string | null>(null);
-  const [aiLoading, setAiLoading] = useState(false);
+  const [aiSummaryThinking, setAiSummaryThinking] = useState("");
+  const [aiSummaryLoading, setAiSummaryLoading] = useState(false);
+  const [aiSummaryError, setAiSummaryError] = useState<string | null>(null);
+  const [aiDraftLoading, setAiDraftLoading] = useState(false);
+  const [aiDraftError, setAiDraftError] = useState<string | null>(null);
+  const [aiReplyBody, setAiReplyBody] = useState<string>("");
+  const [aiReplyThinking, setAiReplyThinking] = useState("");
+  const [replyEditorKey, setReplyEditorKey] = useState("empty");
+  const [showInlineReply, setShowInlineReply] = useState(false);
+  const [inlineReplyTo, setInlineReplyTo] = useState("");
+  const [inlineReplyCc, setInlineReplyCc] = useState("");
+  const [inlineReplySubject, setInlineReplySubject] = useState("");
+  const [inlineReplyInReplyTo, setInlineReplyInReplyTo] = useState<string | undefined>();
+  const [inlineReplyReferences, setInlineReplyReferences] = useState<string[] | undefined>();
+
+  const [aiDraftBody, setAiDraftBody] = useState<string | null>(null);
+
+  const aiTone = (aiConfig?.default_tone || "Professional") as AiTone;
+  const aiLanguage = aiConfig?.output_language || "en";
+  const aiActionLabels = getAiActionLabels(aiLanguage);
+  const aiPanelLabels = getAiPanelLabels(aiLanguage);
+  const aiThinkingLabels = getAiThinkingLabels(aiLanguage);
+
+  const activeStreamIdRef = useRef<string | null>(null);
+  const activeStreamKindRef = useRef<"summary" | "reply" | null>(null);
+
+  const hydrateEmailBodies = useCallback(async (list: Email[]) => {
+    const needsFetch = list.filter((e) => !e.body_html && !e.body_text);
+    if (needsFetch.length === 0) return list;
+    await Promise.all(needsFetch.map((e) => fetchEmailBody(e.id).catch(() => {})));
+    if (selectedThread && selectedThread > 0) {
+      return getEmails(selectedThread);
+    }
+    return Promise.all(
+      list.map(async (e) => {
+        if (e.body_html || e.body_text) return e;
+        const refreshed = await getEmails(e.thread_id).catch(() => []);
+        return refreshed.find((r) => r.id === e.id) ?? e;
+      }),
+    );
+  }, [selectedThread]);
 
   useEffect(() => {
     listAccounts().then(setAccounts).catch(console.error);
@@ -170,6 +424,77 @@ export default function InboxPage() {
   useEffect(() => {
     loadThreads();
   }, [loadThreads]);
+
+  const resetAiStream = useCallback(() => {
+    activeStreamIdRef.current = null;
+    activeStreamKindRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const [unlistenStream, unlistenError] = await Promise.all([
+        onAiStream((event) => {
+          if (event.streamId !== activeStreamIdRef.current) return;
+          const kind = activeStreamKindRef.current;
+          if (!kind) return;
+          if (event.done) {
+            if (kind === "summary") setAiSummaryLoading(false);
+            else setAiDraftLoading(false);
+            resetAiStream();
+            return;
+          }
+          if (kind === "summary") {
+            if (event.tokenKind === "thinking") {
+              setAiSummaryThinking((prev) => prev + event.token);
+            } else {
+              setAiSummary((prev) => (prev ?? "") + event.token);
+            }
+          } else if (event.tokenKind === "thinking") {
+            setAiReplyThinking((prev) => prev + event.token);
+          } else {
+            setAiReplyBody((prev) => prev + event.token);
+          }
+        }),
+        onAiStreamError((event) => {
+          if (event.streamId !== activeStreamIdRef.current) return;
+          const kind = activeStreamKindRef.current;
+          if (kind === "summary") {
+            setAiSummaryError(event.token);
+            setAiSummaryLoading(false);
+          } else {
+            setAiDraftError(event.token);
+            setAiDraftLoading(false);
+            setStatusMessage(event.token);
+          }
+          resetAiStream();
+        }),
+      ]);
+      if (cancelled) {
+        unlistenStream();
+        unlistenError();
+        return;
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [resetAiStream]);
+
+  const clearAiState = useCallback(() => {
+    setAiSummary(null);
+    setAiSummaryThinking("");
+    setAiSummaryLoading(false);
+    setAiSummaryError(null);
+    setAiDraftLoading(false);
+    setAiDraftError(null);
+    setAiReplyBody("");
+    setAiReplyThinking("");
+    resetAiStream();
+  }, [resetAiStream]);
+
+  const showSummaryPanel =
+    aiSummary !== null || aiSummaryLoading || aiSummaryError !== null;
 
   const handleSync = async () => {
     setSyncing(true);
@@ -212,6 +537,8 @@ export default function InboxPage() {
 
   const handleSelectThread = async (thread: Thread) => {
     setSelectedThread(thread.id);
+    clearAiState();
+    setShowInlineReply(false);
     try {
       const list = await getEmails(thread.id);
       setEmails(list);
@@ -260,7 +587,13 @@ export default function InboxPage() {
         const items = await getSendQueue();
         setPendingQueueCount(items.filter((i) => i.status === "pending").length);
       }
+      setShowInlineReply(false);
       setComposing(false);
+      setAiReplyBody("");
+      setAiReplyThinking("");
+      setAiDraftBody(null);
+      setAiDraftLoading(false);
+      setAiDraftError(null);
     } catch (e) {
       setStatusMessage(String(e));
     } finally {
@@ -269,38 +602,83 @@ export default function InboxPage() {
   };
 
   const selectedEmailData = emails.find((e) => e.id === selectedEmail);
+  const lastEmail = emails[emails.length - 1];
+
+  const openReplyComposer = useCallback((email: Email) => {
+    const replyTo = email.from.map((a) => a.address).join(", ");
+    const replyCc = email.cc?.map((a) => a.address).join(", ") || "";
+    const replySubject = email.subject
+      ? email.subject.startsWith("Re:") || email.subject.startsWith("re:")
+        ? email.subject
+        : `Re: ${email.subject}`
+      : "";
+    setInlineReplyTo(replyTo);
+    setInlineReplyCc(replyCc);
+    setInlineReplySubject(replySubject);
+    setInlineReplyInReplyTo(email.message_id);
+    setInlineReplyReferences(
+      [...(email.references || []), email.message_id].filter(Boolean),
+    );
+    setShowInlineReply(true);
+  }, []);
 
   const handleSummarize = async () => {
-    if (!selectedThread) return;
-    setAiLoading(true);
-    setAiSummary(null);
+    if (!selectedThread || !aiConfig || emails.length === 0) return;
+    resetAiStream();
+    setAiSummaryLoading(true);
+    setAiSummaryError(null);
+    setAiSummary("");
+    setAiSummaryThinking("");
+
     try {
-      const tone = aiConfig?.default_tone || "Professional";
-      const result = await summarizeThread(selectedThread, tone as AiTone);
-      setAiSummary(result);
+      const hydrated = await hydrateEmailBodies(emails);
+      setEmails(hydrated);
+      const emailIds = hydrated.map((e) => e.id);
+      const streamId = crypto.randomUUID();
+      activeStreamIdRef.current = streamId;
+      activeStreamKindRef.current = "summary";
+      await streamSummarizeThread(streamId, selectedThread, emailIds, aiTone);
     } catch (e) {
-      setAiSummary(`Error: ${e}`);
-    } finally {
-      setAiLoading(false);
+      setAiSummaryError(String(e));
+      setAiSummaryLoading(false);
+      resetAiStream();
     }
   };
 
   const handleDraftReply = async () => {
-    if (!selectedThread) return;
-    setAiLoading(true);
+    if (!selectedThread || !lastEmail || !aiConfig || emails.length === 0) return;
+    resetAiStream();
+    setAiDraftError(null);
+    setAiReplyBody("");
+    setAiReplyThinking("");
+    openReplyComposer(lastEmail);
+    setReplyEditorKey("drafting");
+    setAiDraftLoading(true);
+
     try {
-      const tone = aiConfig?.default_tone || "Professional";
-      const result = await draftReply(selectedThread, tone as AiTone);
-      setComposing(true);
-      setAiDraftBody(result);
+      const hydrated = await hydrateEmailBodies(emails);
+      setEmails(hydrated);
+      const emailIds = hydrated.map((e) => e.id);
+      const streamId = crypto.randomUUID();
+      activeStreamIdRef.current = streamId;
+      activeStreamKindRef.current = "reply";
+      await streamDraftReply(streamId, selectedThread, emailIds, aiTone);
     } catch (e) {
-      console.error(e);
-    } finally {
-      setAiLoading(false);
+      setAiDraftError(String(e));
+      setStatusMessage(String(e));
+      setAiDraftLoading(false);
+      resetAiStream();
     }
   };
 
-  const [aiDraftBody, setAiDraftBody] = useState<string | null>(null);
+  const handleManualReply = () => {
+    if (!lastEmail) return;
+    setAiDraftError(null);
+    setAiReplyBody("");
+    setAiReplyThinking("");
+    setReplyEditorKey(`manual-${Date.now()}`);
+    openReplyComposer(lastEmail);
+  };
 
   return (
     <div className="flex h-full">
@@ -331,7 +709,7 @@ export default function InboxPage() {
               />
               {online ? "Online" : "Offline"}
             </span>
-            <span className="text-xs text-muted-foreground">·</span>
+            <span className="text-xs text-muted-foreground">&#183;</span>
             <button
               type="button"
               onClick={() => setShowQueue(!showQueue)}
@@ -416,9 +794,12 @@ export default function InboxPage() {
                   selectedThread === thread.id ? "bg-accent" : ""
                 } ${!thread.is_read ? "font-medium" : ""}`}
               >
-                <p className="text-sm truncate">
-                  {thread.subject || "(no subject)"}
-                </p>
+                <div className="flex items-center gap-1.5">
+                  <ThreadLabels thread={thread} />
+                  <p className="text-sm truncate flex-1">
+                    {thread.subject || "(no subject)"}
+                  </p>
+                </div>
                 <div className="flex items-center justify-between">
                   <p className="text-xs text-muted-foreground">
                     {thread.message_count} msg
@@ -445,6 +826,10 @@ export default function InboxPage() {
             bcc=""
             subject=""
             initialBodyHtml={aiDraftBody || undefined}
+            aiEnabled={!!aiConfig && online}
+            aiTone={aiTone}
+            outputLanguage={aiLanguage}
+            polishLabels={getComposePolishLabels(aiLanguage)}
             onSend={handleSend}
             onCancel={() => {
               setComposing(false);
@@ -492,25 +877,25 @@ export default function InboxPage() {
               {!online && (
                 <span className="text-xs text-yellow-600">Offline</span>
               )}
-              {aiConfig && online && selectedThread && (
-                <>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleSummarize}
-                    disabled={aiLoading}
-                  >
-                    {aiLoading && !aiSummary ? "..." : "Summarize"}
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleDraftReply}
-                    disabled={aiLoading}
-                  >
-                    AI Reply
-                  </Button>
-                </>
+              {online && selectedThread && aiConfig && emails.length > 0 && (
+                <AiActionButtons
+                  labels={aiActionLabels}
+                  onSummarize={handleSummarize}
+                  onDraftReply={handleDraftReply}
+                  summarizeLoading={aiSummaryLoading}
+                  draftLoading={aiDraftLoading}
+                  disabled={!lastEmail}
+                />
+              )}
+              {online && lastEmail && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleManualReply}
+                  disabled={aiSummaryLoading || aiDraftLoading}
+                >
+                  Reply
+                </Button>
               )}
               <Button
                 variant="outline"
@@ -520,34 +905,93 @@ export default function InboxPage() {
                 Compose
               </Button>
             </div>
-            <div className="flex-1 overflow-y-auto">
-              {aiSummary && (
-                <div className="border-b border-border p-3 bg-accent/30">
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-xs font-semibold">AI Summary</span>
-                    <button
-                      onClick={() => setAiSummary(null)}
-                      className="text-xs text-muted-foreground hover:text-foreground"
+            <div className="flex flex-1 min-h-0 overflow-hidden">
+              <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
+                <div className="flex-1 overflow-y-auto min-h-0">
+                  {online && selectedThread && !aiConfig && (
+                    <div className="border-b border-border px-4 py-3 flex items-center justify-between gap-3 bg-muted/20">
+                      <p className="text-sm text-muted-foreground">
+                        Connect AI in Settings to summarize threads and draft replies.
+                      </p>
+                      <Link
+                        to="/settings"
+                        className="shrink-0 inline-flex items-center gap-1.5 text-xs font-medium text-violet-400 hover:text-violet-300"
+                      >
+                        <Settings className="h-3.5 w-3.5" />
+                        Settings
+                      </Link>
+                    </div>
+                  )}
+                  {emails.map((email, idx) => (
+                    <div
+                      key={email.id}
+                      className={`${idx > 0 ? "border-t border-border" : ""} ${
+                        email.id === selectedEmail
+                          ? ""
+                          : "cursor-pointer hover:bg-accent/50"
+                      }`}
+                      onClick={() => setSelectedEmail(email.id)}
                     >
-                      Dismiss
-                    </button>
+                      <EmailViewer email={email} />
+                    </div>
+                  ))}
+                </div>
+                {showInlineReply && (
+                  <div className="shrink-0 border-t border-border">
+                    {aiDraftError && !aiDraftLoading && (
+                      <div className="px-4 py-2 bg-destructive/5 text-sm text-destructive">
+                        {aiDraftError}
+                      </div>
+                    )}
+                    <AiThinkingStrip
+                      thinkingLabel={aiThinkingLabels.thinking}
+                      thinking={aiReplyThinking}
+                      loading={aiDraftLoading && !aiReplyBody}
+                    />
+                    <InlineReplyEditor
+                      key={replyEditorKey}
+                      accountId={selectedAccount || accounts[0]?.id || 0}
+                      to={inlineReplyTo}
+                      cc={inlineReplyCc}
+                      subject={inlineReplySubject}
+                      initialBodyHtml={
+                        !aiDraftLoading && aiReplyBody
+                          ? plainTextToHtml(aiReplyBody)
+                          : undefined
+                      }
+                      streamingBody={aiDraftLoading ? aiReplyBody : undefined}
+                      bodyKey={replyEditorKey}
+                      generating={aiDraftLoading}
+                      inReplyTo={inlineReplyInReplyTo}
+                      references={inlineReplyReferences}
+                      onSend={handleSend}
+                      onCancel={() => {
+                        setShowInlineReply(false);
+                        setAiReplyBody("");
+                        setAiReplyThinking("");
+                        setAiDraftError(null);
+                      }}
+                      sending={sending}
+                    />
                   </div>
-                  <div className="text-sm whitespace-pre-wrap">{aiSummary}</div>
-                </div>
+                )}
+              </div>
+              {showSummaryPanel && (
+                <AiSummaryPanel
+                  labels={aiPanelLabels}
+                  summary={aiSummary}
+                  thinking={aiSummaryThinking}
+                  loading={aiSummaryLoading}
+                  error={aiSummaryError}
+                  onDismiss={() => {
+                    setAiSummary(null);
+                    setAiSummaryThinking("");
+                    setAiSummaryError(null);
+                    setAiSummaryLoading(false);
+                  }}
+                  onRetry={handleSummarize}
+                />
               )}
-              {emails.map((email, idx) => (
-                <div
-                  key={email.id}
-                  className={`${idx > 0 ? "border-t border-border" : ""} ${
-                    email.id === selectedEmail
-                      ? ""
-                      : "cursor-pointer hover:bg-accent/50"
-                  }`}
-                  onClick={() => setSelectedEmail(email.id)}
-                >
-                  <EmailViewer email={email} />
-                </div>
-              ))}
             </div>
           </div>
         ) : (

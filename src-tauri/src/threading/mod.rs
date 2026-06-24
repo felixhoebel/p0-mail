@@ -10,6 +10,7 @@ struct RawEmail {
     subject: Option<String>,
     received_at: i64,
     is_read: bool,
+    is_flagged: bool,
 }
 
 pub struct ThreadingService;
@@ -33,7 +34,7 @@ impl ThreadingService {
         let conn = db::get()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, message_id, in_reply_to, \"references\", subject, received_at, is_read \
+                "SELECT id, message_id, in_reply_to, \"references\", subject, received_at, is_read, labels \
                  FROM emails WHERE account_id = ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -44,6 +45,8 @@ impl ThreadingService {
                 let refs: Option<Vec<String>> = refs_str
                     .as_deref()
                     .and_then(|s| serde_json::from_str(s).ok());
+                let labels_str: String = row.get(7)?;
+                let labels: Vec<String> = serde_json::from_str(&labels_str).unwrap_or_default();
                 Ok(RawEmail {
                     id: row.get(0)?,
                     message_id: row.get(1)?,
@@ -52,6 +55,7 @@ impl ThreadingService {
                     subject: row.get(4)?,
                     received_at: row.get(5)?,
                     is_read: row.get::<_, i64>(6)? != 0,
+                    is_flagged: labels.iter().any(|l| l == "\\Flagged"),
                 })
             })
             .map_err(|e| e.to_string())?
@@ -190,15 +194,18 @@ impl ThreadingService {
 
             let is_read = thread_indices.iter().all(|&i| emails[i as usize].is_read);
 
+            let is_flagged = thread_indices.iter().any(|&i| emails[i as usize].is_flagged);
+
             conn.execute(
-                "INSERT INTO threads (account_id, subject, latest_date, message_count, is_read) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO threads (account_id, subject, latest_date, message_count, is_read, is_flagged) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     account_id,
                     subject,
                     latest_date,
                     message_count,
                     is_read as i64,
+                    is_flagged as i64,
                 ],
             )
             .map_err(|e| e.to_string())?;

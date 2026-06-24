@@ -164,6 +164,19 @@ impl SyncEngine {
 
             let is_read = fetch.flags().any(|f| f == async_imap::types::Flag::Seen);
 
+            let labels: Vec<String> = fetch
+                .flags()
+                .filter_map(|f| match f {
+                    async_imap::types::Flag::Flagged => Some("\\Flagged".to_string()),
+                    async_imap::types::Flag::Answered => Some("\\Answered".to_string()),
+                    async_imap::types::Flag::Draft => Some("\\Draft".to_string()),
+                    async_imap::types::Flag::Deleted => Some("\\Deleted".to_string()),
+                    async_imap::types::Flag::Custom(ref k) => Some(k.to_string()),
+                    _ => None,
+                })
+                .collect();
+            let labels_json = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string());
+
             let body_text: Option<String> = None;
             let body_html: Option<String> = None;
 
@@ -177,8 +190,8 @@ impl SyncEngine {
                     "INSERT INTO emails \
                       (thread_id, account_id, imap_uid, message_id, in_reply_to, \
                        \"references\", subject, from_json, to_json, cc_json, bcc_json, \
-                      date_rfc2822, received_at, body_text, body_html, is_read, folder) \
-                     VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'INBOX')",
+                      date_rfc2822, received_at, body_text, body_html, is_read, folder, labels) \
+                     VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'INBOX', ?16)",
                     rusqlite::params![
                         account_id,
                         uid,
@@ -195,6 +208,7 @@ impl SyncEngine {
                         body_text,
                         body_html,
                         is_read as i64,
+                        labels_json,
                     ],
                 )
                 .map_err(|e| format!("Failed to insert email: {}", e))?;
