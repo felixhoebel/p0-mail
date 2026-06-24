@@ -35,12 +35,14 @@ export default function EmailChatPanel({
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
+    let cancelled = false;
     let unlistenStream: (() => void) | null = null;
     let unlistenError: (() => void) | null = null;
 
     (async () => {
-      [unlistenStream, unlistenError] = await Promise.all([
+      const [s, e] = await Promise.all([
         onAiStream((event) => {
+          if (cancelled) return;
           if (event.streamId !== streamIdRef.current) return;
           if (event.done) {
             setStreaming(false);
@@ -58,15 +60,24 @@ export default function EmailChatPanel({
           }
         }),
         onAiStreamError((event) => {
+          if (cancelled) return;
           if (event.streamId !== streamIdRef.current) return;
           setError(event.token);
           setStreaming(false);
           streamIdRef.current = null;
         }),
       ]);
+      if (cancelled) {
+        s();
+        e();
+        return;
+      }
+      unlistenStream = s;
+      unlistenError = e;
     })();
 
     return () => {
+      cancelled = true;
       unlistenStream?.();
       unlistenError?.();
     };
