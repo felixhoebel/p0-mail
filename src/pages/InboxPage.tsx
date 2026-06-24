@@ -403,6 +403,8 @@ export default function InboxPage() {
   const [aiDraftBody, setAiDraftBody] = useState<string | null>(null);
   const [showChat, setShowChat] = useState(false);
   const [chatEmailIds, setChatEmailIds] = useState<number[]>([]);
+  const [busyThreadIds, setBusyThreadIds] = useState<Set<number>>(new Set());
+  const [busyEmailIds, setBusyEmailIds] = useState<Set<number>>(new Set());
 
   const searchInputRef = useRef<HTMLInputElement>(null);
   const ctxMenu = useContextMenu();
@@ -660,11 +662,15 @@ export default function InboxPage() {
   const lastEmail = emails[emails.length - 1];
 
   const handleArchive = useCallback(async (emailId: number) => {
+    const threadId = selectedThread;
+    if (threadId) setBusyThreadIds((prev) => new Set(prev).add(threadId));
+    setBusyEmailIds((prev) => new Set(prev).add(emailId));
     await archiveEmail(emailId).catch(console.error);
-    if (selectedThread) {
-      const remaining = await getEmails(selectedThread).catch(() => []);
+    setBusyEmailIds((prev) => { const n = new Set(prev); n.delete(emailId); return n; });
+    if (threadId) {
+      const remaining = await getEmails(threadId).catch(() => []);
       if (remaining.length === 0) {
-        setThreads((prev) => prev.filter((t) => t.id !== selectedThread));
+        setThreads((prev) => prev.filter((t) => t.id !== threadId));
         setSelectedThread(null);
         setSelectedEmail(null);
         setEmails([]);
@@ -673,15 +679,20 @@ export default function InboxPage() {
         setSelectedEmail(remaining[remaining.length - 1].id);
       }
     }
+    setBusyThreadIds((prev) => { const n = new Set(prev); if (threadId) n.delete(threadId); return n; });
     loadThreads();
   }, [selectedThread, loadThreads]);
 
   const handleDelete = useCallback(async (emailId: number) => {
+    const threadId = selectedThread;
+    if (threadId) setBusyThreadIds((prev) => new Set(prev).add(threadId));
+    setBusyEmailIds((prev) => new Set(prev).add(emailId));
     await deleteEmail(emailId).catch(console.error);
-    if (selectedThread) {
-      const remaining = await getEmails(selectedThread).catch(() => []);
+    setBusyEmailIds((prev) => { const n = new Set(prev); n.delete(emailId); return n; });
+    if (threadId) {
+      const remaining = await getEmails(threadId).catch(() => []);
       if (remaining.length === 0) {
-        setThreads((prev) => prev.filter((t) => t.id !== selectedThread));
+        setThreads((prev) => prev.filter((t) => t.id !== threadId));
         setSelectedThread(null);
         setSelectedEmail(null);
         setEmails([]);
@@ -690,6 +701,7 @@ export default function InboxPage() {
         setSelectedEmail(remaining[remaining.length - 1].id);
       }
     }
+    setBusyThreadIds((prev) => { const n = new Set(prev); if (threadId) n.delete(threadId); return n; });
     loadThreads();
   }, [selectedThread, loadThreads]);
 
@@ -822,15 +834,19 @@ export default function InboxPage() {
           icon: <Archive className="h-3.5 w-3.5" />,
           danger: true,
           onClick: async () => {
+            setBusyThreadIds((prev) => new Set(prev).add(thread.id));
             const fetched = await getEmails(thread.id).catch(() => []);
             for (const em of fetched) {
+              setBusyEmailIds((prev) => new Set(prev).add(em.id));
               await archiveEmail(em.id).catch(() => {});
+              setBusyEmailIds((prev) => { const n = new Set(prev); n.delete(em.id); return n; });
             }
             if (selectedThread === thread.id) {
               setSelectedThread(null);
               setSelectedEmail(null);
               setEmails([]);
             }
+            setBusyThreadIds((prev) => { const n = new Set(prev); n.delete(thread.id); return n; });
             loadThreads();
           },
         },
@@ -839,15 +855,19 @@ export default function InboxPage() {
           icon: <Trash2 className="h-3.5 w-3.5" />,
           danger: true,
           onClick: async () => {
+            setBusyThreadIds((prev) => new Set(prev).add(thread.id));
             const fetched = await getEmails(thread.id).catch(() => []);
             for (const em of fetched) {
+              setBusyEmailIds((prev) => new Set(prev).add(em.id));
               await deleteEmail(em.id).catch(() => {});
+              setBusyEmailIds((prev) => { const n = new Set(prev); n.delete(em.id); return n; });
             }
             if (selectedThread === thread.id) {
               setSelectedThread(null);
               setSelectedEmail(null);
               setEmails([]);
             }
+            setBusyThreadIds((prev) => { const n = new Set(prev); n.delete(thread.id); return n; });
             loadThreads();
           },
         },
@@ -909,7 +929,7 @@ export default function InboxPage() {
       } else if (e.key === "r" && selectedEmailData) {
         e.preventDefault();
         handleManualReply();
-      } else if (e.key === "c") {
+      } else if ((e.metaKey || e.ctrlKey) && e.key === "n") {
         e.preventDefault();
         setComposing(true);
       } else if (e.key === "s" && selectedThread && aiConfig) {
@@ -1076,6 +1096,7 @@ export default function InboxPage() {
                 const showHeader = group !== currentGroup;
                 currentGroup = group;
                 const selected = selectedThread === thread.id;
+                const threadBusy = busyThreadIds.has(thread.id);
                 return (
                   <div key={thread.id}>
                     {showHeader && (
@@ -1084,16 +1105,22 @@ export default function InboxPage() {
                       </div>
                     )}
                     <div
-                      onClick={() => handleSelectThread(thread)}
+                      onClick={() => !threadBusy && handleSelectThread(thread)}
                       onContextMenu={(e) => handleThreadContextMenu(e, thread)}
                       className={`relative flex items-start gap-2.5 px-3 py-2.5 cursor-pointer transition-colors group ${
-                        selected
+                        threadBusy ? "opacity-50 pointer-events-none" : ""
+                      } ${selected
                           ? "bg-accent"
                           : "hover:bg-accent/50"
                       }`}
                     >
                       {selected && (
                         <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-foreground" />
+                      )}
+                      {threadBusy && (
+                        <div className="absolute right-2 top-2.5">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                        </div>
                       )}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-1.5">
@@ -1248,10 +1275,14 @@ export default function InboxPage() {
               <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
                 {/* Email list */}
                 <div className="flex-1 overflow-y-auto min-h-0 scrollbar-thin">
-                  {emails.map((email, idx) => (
+                  {emails.map((email, idx) => {
+                    const emailBusy = busyEmailIds.has(email.id);
+                    return (
                     <div
                       key={email.id}
-                      className={`${idx > 0 ? "border-t border-border" : ""} ${
+                      className={`relative ${idx > 0 ? "border-t border-border" : ""} ${
+                        emailBusy ? "opacity-50 pointer-events-none" : ""
+                      } ${
                         email.id === selectedEmail
                           ? ""
                           : "cursor-pointer hover:bg-accent/30"
@@ -1259,9 +1290,15 @@ export default function InboxPage() {
                       onClick={() => setSelectedEmail(email.id)}
                       onContextMenu={(e) => handleEmailContextMenu(e, email)}
                     >
+                      {emailBusy && (
+                        <div className="absolute right-3 top-3 z-10">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                        </div>
+                      )}
                       <EmailViewer email={email} />
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
 
                 {/* Inline reply */}
