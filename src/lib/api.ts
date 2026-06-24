@@ -153,6 +153,10 @@ export async function validateAiEndpoint(): Promise<boolean> {
   return invoke("validate_ai_endpoint");
 }
 
+export async function listAiModels(): Promise<string[]> {
+  return invoke("list_ai_models");
+}
+
 export async function streamSummarizeThread(
   streamId: string,
   threadId: number,

@@ -976,6 +976,18 @@ async fn validate_ai_endpoint() -> Result<bool, String> {
 }
 
 #[tauri::command]
+async fn list_ai_models() -> Result<Vec<String>, String> {
+    let config = get_ai_config()?;
+    match config {
+        Some(c) => {
+            let service = ai::AiService::new();
+            service.list_models(&c.base_url, &c.api_key).await
+        }
+        None => Err("AI not configured".to_string()),
+    }
+}
+
+#[tauri::command]
 async fn stream_summarize_thread(
     app: tauri::AppHandle,
     stream_id: String,
@@ -1284,6 +1296,7 @@ pub fn run() {
             get_ai_config,
             set_ai_config,
             validate_ai_endpoint,
+            list_ai_models,
             stream_summarize_thread,
             stream_draft_reply,
             stream_ai_transform,

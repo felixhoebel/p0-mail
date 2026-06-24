@@ -23,8 +23,14 @@ pub struct ChatMessage {
 
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
-    #[allow(dead_code)]
-    data: Vec<serde_json::Value>,
+    data: Vec<ModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelInfo {
+    id: String,
+    capabilities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +90,47 @@ impl AiService {
             let body = resp.text().await.unwrap_or_default();
             Err(format!("Endpoint returned {}: {}", status, body))
         }
+    }
+
+    pub async fn list_models(
+        &self,
+        base_url: &str,
+        api_key: &str,
+    ) -> Result<Vec<String>, String> {
+        let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| format!("Connection failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Endpoint returned {}: {}", status, body));
+        }
+
+        let models: ModelsResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("Invalid response: {}", e))?;
+
+        let chat_models: Vec<String> = models
+            .data
+            .into_iter()
+            .filter(|m| {
+                m.capabilities
+                    .as_ref()
+                    .map(|caps| caps.iter().any(|c| c == "chat" || c == "completions"))
+                    .unwrap_or(true)
+            })
+            .map(|m| m.id)
+            .collect();
+
+        Ok(chat_models)
     }
 
     pub async fn stream_summarize_thread(

@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -17,6 +18,7 @@ import {
   getAiConfig,
   setAiConfig,
   validateAiEndpoint,
+  listAiModels,
   triggerSync,
 } from "@/lib/api";
 import type { Account, AiConfig, AiOutputLanguage, EncryptionType } from "@/types";
@@ -324,6 +326,9 @@ function AiConfigSection() {
   const [saving, setSaving] = useState(false);
   const [validating, setValidating] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [models, setModels] = useState<string[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
 
   const applyConfig = (c: AiConfig | null) => {
     if (!c) return;
@@ -381,6 +386,24 @@ function AiConfigSection() {
     }
   };
 
+  const handleFetchModels = async () => {
+    setLoadingModels(true);
+    setMessage(null);
+    try {
+      await handleSave();
+      const list = await listAiModels();
+      setModels(list);
+      if (list.length > 0 && !list.includes(model)) {
+        setModel(list[0]);
+      }
+      setModelDropdownOpen(true);
+    } catch (e) {
+      setMessage(String(e));
+    } finally {
+      setLoadingModels(false);
+    }
+  };
+
   return (
     <div className="space-y-4">
       <p className="text-sm text-muted-foreground leading-relaxed">
@@ -408,11 +431,56 @@ function AiConfigSection() {
       </div>
       <div>
         <label className="text-sm font-medium">Model</label>
-        <Input
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          placeholder="gpt-4o"
-        />
+        <div className="relative mt-1">
+          <div className="flex gap-2">
+            <Input
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder="gpt-4o"
+              className="flex-1"
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={handleFetchModels}
+              disabled={loadingModels}
+              className="h-9 shrink-0"
+            >
+              {loadingModels ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                "Fetch"
+              )}
+            </Button>
+          </div>
+          {modelDropdownOpen && models.length > 0 && (
+            <div className="absolute z-10 mt-1 w-full max-h-60 overflow-y-auto rounded-md border border-border bg-popover shadow-lg scrollbar-thin">
+              {models.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => {
+                    setModel(m);
+                    setModelDropdownOpen(false);
+                  }}
+                  className={`flex w-full items-center px-3 py-2 text-sm text-left transition-colors ${
+                    m === model
+                      ? "bg-accent text-foreground"
+                      : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+                  }`}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          )}
+          {modelDropdownOpen && models.length === 0 && !loadingModels && (
+            <div className="absolute z-10 mt-1 w-full rounded-md border border-border bg-popover shadow-lg px-3 py-2 text-sm text-muted-foreground">
+              No chat models found
+            </div>
+          )}
+        </div>
       </div>
       <div>
         <label className="text-sm font-medium">Default tone</label>

@@ -258,6 +258,16 @@ function InlineReplyEditor({
     }
   }, [editor, initialBodyHtml, streamingBody]);
 
+  useEffect(() => {
+    const t = setTimeout(() => {
+      if (generating) return;
+      if (editor && editor.getText().trim() === "") {
+        editor.commands.focus();
+      }
+    }, 50);
+    return () => clearTimeout(t);
+  }, [editor, generating]);
+
   const handleSend = useCallback(() => {
     if (!editor) return;
     const bodyHtml = editor.getHTML();

@@ -1,6 +1,6 @@
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
-import { useCallback, useState, useEffect } from "react";
+import { useCallback, useState, useEffect, useRef } from "react";
 import { Sparkles, X, CornerDownLeft } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -54,6 +54,11 @@ export default function ComposeEditor({
   const [subject, setSubject] = useState(initialSubject);
   const [showCc, setShowCc] = useState(!!initialCc || !!initialBcc);
   const [aiBusy, setAiBusy] = useState(false);
+  const toRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    toRef.current?.focus();
+  }, []);
 
   const editor = useEditor({
     extensions: [StarterKit],
@@ -131,6 +136,7 @@ export default function ComposeEditor({
         <div className="flex items-center gap-3">
           <label className="text-[11px] font-medium text-muted-foreground w-10 shrink-0 uppercase tracking-wider">To</label>
           <Input
+            ref={toRef}
             value={to}
             onChange={(e) => setTo(e.target.value)}
             placeholder="recipient@example.com"
