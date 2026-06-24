@@ -17,7 +17,7 @@ export default function AiThinkingStrip({
   if (!thinking && !loading) return null;
 
   return (
-    <div className="mx-4 mt-2 rounded-lg border border-border/80 bg-muted/25 overflow-hidden shrink-0">
+    <div className="mx-5 mt-2.5 rounded-lg border border-border/60 bg-muted/30 overflow-hidden shrink-0 animate-fade-in">
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}

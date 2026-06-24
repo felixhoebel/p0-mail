@@ -196,6 +196,39 @@ impl AiService {
         .await
     }
 
+    pub async fn stream_ai_transform(
+        &self,
+        app: &AppHandle,
+        stream_id: &str,
+        tone: &str,
+        instruction: &str,
+        subject: &str,
+        text: &str,
+    ) -> Result<(), String> {
+        let text = text.trim();
+        if text.is_empty() {
+            let err = "Select some text to transform.".to_string();
+            emit_stream_error(app, stream_id, &err);
+            return Err(err);
+        }
+
+        let settings = self.get_settings(tone).map_err(|e| {
+            emit_stream_error(app, stream_id, &e);
+            e
+        })?;
+        let prompt = self.build_ai_transform_prompt(&settings, instruction, subject, text);
+        self.stream_chat(
+            app,
+            stream_id,
+            &settings.base_url,
+            &settings.api_key,
+            &settings.model,
+            prompt,
+            4096,
+        )
+        .await
+    }
+
     fn get_settings(&self, tone: &str) -> Result<AiSettings, String> {
         let conn = db::get()?;
         let base_url: String = conn
@@ -537,6 +570,57 @@ impl AiService {
         let user = format!(
             "Subject (for context): {}\n\nRough draft:\n{}",
             subject_hint, draft
+        );
+
+        vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: system,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: user,
+            },
+        ]
+    }
+
+    fn build_ai_transform_prompt(
+        &self,
+        settings: &AiSettings,
+        instruction: &str,
+        subject: &str,
+        text: &str,
+    ) -> Vec<ChatMessage> {
+        let language = output_language_name(&settings.output_language);
+        let subject_hint = if subject.trim().is_empty() {
+            "(no subject)".to_string()
+        } else {
+            subject.trim().to_string()
+        };
+
+        let instruction_text = match instruction {
+            "polish" => "Polish and improve the writing. Fix grammar, improve flow, and make it more natural and readable.",
+            "shorten" => "Make it shorter while keeping all key points and intent. Be concise.",
+            "expand" => "Expand on the ideas with more detail and elaboration.",
+            "friendly" => "Rewrite in a friendly, warm, and approachable tone.",
+            "professional" => "Rewrite in a professional, formal tone.",
+            "concise" => "Rewrite to be concise, direct, and to the point.",
+            _ => instruction,
+        };
+
+        let mut system = format!(
+            "You are an email writing assistant. Transform the given text according to the instruction. \
+             Write the output entirely in {}. \
+             Preserve the user's intent and every fact — do not invent names, dates, or details. \
+             Output only the transformed text, no explanations, no preamble, no quotation marks. \
+             Put your complete output in the message content field.",
+            language
+        );
+        append_custom_instructions(&mut system, &settings.custom_instructions);
+
+        let user = format!(
+            "Subject (for context): {}\nInstruction: {}\n\nText to transform:\n{}",
+            subject_hint, instruction_text, text
         );
 
         vec![

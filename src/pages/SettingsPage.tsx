@@ -490,12 +490,13 @@ export default function SettingsPage() {
   };
 
   return (
-    <div className="h-full overflow-y-auto p-6 max-w-2xl">
-      <h2 className="text-xl font-bold mb-6">Settings</h2>
+    <div className="h-full overflow-y-auto scrollbar-thin p-8 max-w-2xl">
+      <h2 className="text-lg font-semibold mb-1">Settings</h2>
+      <p className="text-sm text-muted-foreground mb-8">Manage your accounts and AI configuration.</p>
 
-      <Card className="mb-6">
+      <Card className="mb-6 border-border">
         <CardHeader>
-          <CardTitle>Accounts</CardTitle>
+          <CardTitle className="text-sm">Accounts</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
           <AccountList accounts={accounts} onRemove={handleRemove} />
@@ -505,7 +506,7 @@ export default function SettingsPage() {
 
       <Card className="border-violet-500/15">
         <CardHeader>
-          <CardTitle>AI</CardTitle>
+          <CardTitle className="text-sm">AI</CardTitle>
         </CardHeader>
         <CardContent>
           <AiConfigSection />

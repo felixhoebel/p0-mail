@@ -894,6 +894,20 @@ async fn stream_polish_compose(
 }
 
 #[tauri::command]
+async fn stream_ai_transform(
+    app: tauri::AppHandle,
+    stream_id: String,
+    instruction: String,
+    subject: String,
+    text: String,
+    tone: String,
+) -> Result<(), String> {
+    ai::AiService::new()
+        .stream_ai_transform(&app, &stream_id, &tone, &instruction, &subject, &text)
+        .await
+}
+
+#[tauri::command]
 fn is_online() -> Result<bool, String> {
     Ok(reqwest::blocking::Client::new()
         .head("https://www.google.com")
@@ -1150,6 +1164,7 @@ pub fn run() {
             stream_summarize_thread,
             stream_draft_reply,
             stream_polish_compose,
+            stream_ai_transform,
             is_online,
             validate_imap_connection,
         ])

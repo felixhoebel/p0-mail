@@ -176,6 +176,16 @@ export async function streamPolishCompose(
   return invoke("stream_polish_compose", { streamId, subject, draft, tone });
 }
 
+export async function streamAiTransform(
+  streamId: string,
+  instruction: string,
+  subject: string,
+  text: string,
+  tone: AiTone,
+): Promise<void> {
+  return invoke("stream_ai_transform", { streamId, instruction, subject, text, tone });
+}
+
 function normalizeAiStreamEvent(raw: Record<string, unknown>): AiStreamEvent {
   const kind = raw.tokenKind ?? raw.token_kind ?? "content";
   return {

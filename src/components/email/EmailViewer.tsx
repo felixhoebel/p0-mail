@@ -10,21 +10,21 @@ interface EmailViewerProps {
 function LabelPill({ label }: { label: string }) {
   if (label === "\\Flagged") {
     return (
-      <span className="inline-flex items-center gap-0.5 px-1.5 py-0 rounded text-[10px] font-medium bg-yellow-50 text-yellow-700 border border-yellow-200">
+      <span className="inline-flex items-center gap-0.5 text-[10px] font-medium text-amber-600">
         &#9733; Flagged
       </span>
     );
   }
   if (label === "\\Answered") {
     return (
-      <span className="inline-flex items-center px-1.5 py-0 rounded text-[10px] font-medium bg-green-50 text-green-700 border border-green-200">
+      <span className="inline-flex items-center text-[10px] font-medium text-emerald-600">
         &#8617; Answered
       </span>
     );
   }
   if (label === "\\Draft") {
     return (
-      <span className="inline-flex items-center px-1.5 py-0 rounded text-[10px] font-medium bg-gray-50 text-gray-600 border border-gray-200">
+      <span className="inline-flex items-center px-1.5 text-[10px] font-medium text-muted-foreground border border-border rounded">
         Draft
       </span>
     );
@@ -34,7 +34,7 @@ function LabelPill({ label }: { label: string }) {
   }
   if (label.startsWith("\\")) return null;
   return (
-    <span className="inline-flex items-center px-1.5 py-0 rounded text-[10px] font-medium bg-blue-50 text-blue-700 border border-blue-200">
+    <span className="inline-flex items-center px-1.5 text-[10px] font-medium text-muted-foreground border border-border rounded">
       {label}
     </span>
   );
@@ -86,6 +86,31 @@ function formatAddresses(addrs: { name: string; address: string }[]): string {
     .join(", ");
 }
 
+const AVATAR_COLORS = [
+  "bg-rose-500/15 text-rose-600 dark:text-rose-400",
+  "bg-orange-500/15 text-orange-600 dark:text-orange-400",
+  "bg-amber-500/15 text-amber-600 dark:text-amber-400",
+  "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
+  "bg-teal-500/15 text-teal-600 dark:text-teal-400",
+  "bg-sky-500/15 text-sky-600 dark:text-sky-400",
+  "bg-indigo-500/15 text-indigo-600 dark:text-indigo-400",
+  "bg-violet-500/15 text-violet-600 dark:text-violet-400",
+  "bg-fuchsia-500/15 text-fuchsia-600 dark:text-fuchsia-400",
+];
+
+function avatarColor(seed: string): string {
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) hash = seed.charCodeAt(i) + ((hash << 5) - hash);
+  return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
+}
+
+function initials(name: string): string {
+  const parts = name.split(/[\s@]+/).filter(Boolean);
+  if (parts.length === 0) return "?";
+  if (parts.length === 1) return parts[0][0].toUpperCase();
+  return (parts[0][0] + parts[1][0]).toUpperCase();
+}
+
 export default function EmailViewer({ email }: EmailViewerProps) {
   const [showImages, setShowImages] = useState(false);
 
@@ -120,50 +145,68 @@ export default function EmailViewer({ email }: EmailViewerProps) {
     return /<img\b/i.test(raw);
   }, [email.body_html]);
 
+  const senderName = email.from?.[0]?.name || email.from?.[0]?.address || "Unknown";
+
   return (
-    <div className="flex flex-col h-full">
-      <div className="border-b border-border px-4 py-3 space-y-1 shrink-0">
-        <div className="flex items-start justify-between gap-2">
-          <h2 className="text-base font-semibold leading-tight">
-            {email.subject || "(no subject)"}
-          </h2>
-          {hasImages && !showImages && (
-            <button
-              onClick={() => setShowImages(true)}
-              className="shrink-0 text-xs text-muted-foreground hover:text-foreground border border-border rounded px-2 py-1"
-            >
-              Show Images
-            </button>
-          )}
-        </div>
-        <div className="text-sm text-muted-foreground space-y-0.5">
-          <div>
-            <span className="font-medium text-foreground">From:</span>{" "}
-            {formatAddresses(email.from)}
+    <div className="flex flex-col">
+      {/* Email header */}
+      <div className="px-6 pt-5 pb-3 space-y-2.5">
+        <div className="flex items-start gap-3">
+          <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-medium ${avatarColor(senderName)}`}>
+            {initials(senderName)}
           </div>
-          <div>
-            <span className="font-medium text-foreground">To:</span>{" "}
+          <div className="flex-1 min-w-0">
+            <h2 className="text-[15px] font-semibold leading-tight">
+              {email.subject || "(no subject)"}
+            </h2>
+            <div className="flex items-baseline gap-1.5 mt-0.5">
+              <span className="text-sm font-medium text-foreground truncate">
+                {senderName}
+              </span>
+              <span className="text-xs text-muted-foreground truncate">
+                {email.from?.[0]?.address}
+              </span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {hasImages && !showImages && (
+              <button
+                onClick={() => setShowImages(true)}
+                className="text-[11px] text-muted-foreground hover:text-foreground border border-border rounded-md px-2 py-1 transition-colors"
+              >
+                Show images
+              </button>
+            )}
+            <span className="text-[11px] text-muted-foreground whitespace-nowrap">
+              {formatDate(email.received_at)}
+            </span>
+          </div>
+        </div>
+        {email.to && email.to.length > 0 && (
+          <div className="text-xs text-muted-foreground pl-12">
+            <span className="text-muted-foreground/60">to </span>
             {formatAddresses(email.to)}
           </div>
-          {email.cc && email.cc.length > 0 && (
-            <div>
-              <span className="font-medium text-foreground">Cc:</span>{" "}
-              {formatAddresses(email.cc)}
-            </div>
-          )}
-          <div className="text-xs">{formatDate(email.received_at)}</div>
+        )}
+        {email.cc && email.cc.length > 0 && (
+          <div className="text-xs text-muted-foreground pl-12">
+            <span className="text-muted-foreground/60">cc </span>
+            {formatAddresses(email.cc)}
+          </div>
+        )}
         {email.labels.length > 0 && (
-          <div className="flex items-center gap-1 mt-1 flex-wrap">
+          <div className="flex items-center gap-1.5 pl-12 flex-wrap">
             {email.labels.map((label) => (
               <LabelPill key={label} label={label} />
             ))}
           </div>
         )}
       </div>
-      </div>
-      <div className="flex-1 overflow-y-auto px-4 py-3">
+
+      {/* Email body */}
+      <div className="px-6 pb-6 pt-1">
         <div
-          className="prose prose-sm max-w-none [&_a]:text-primary [&_a]:underline [&_a]:cursor-pointer"
+          className="prose prose-sm max-w-none prose-headings:font-semibold prose-a:text-violet-600 prose-a:no-underline hover:prose-a:underline prose-blockquote:border-l-muted-foreground/30"
           onClick={handleBodyClick}
           dangerouslySetInnerHTML={{ __html: sanitizedHtml }}
         />
