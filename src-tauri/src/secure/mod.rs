@@ -99,3 +99,13 @@ pub fn store_ai_api_key(key: &str) -> Result<(), String> {
 pub fn get_ai_api_key() -> Result<String, String> {
     get_secret("ai_api_key")
 }
+
+const DB_KEY_NAME: &str = "p0mail_db_key";
+
+pub fn get_db_key() -> Result<String, String> {
+    get_secret(DB_KEY_NAME)
+}
+
+pub fn store_db_key(key: &str) -> Result<(), String> {
+    store_secret(DB_KEY_NAME, key)
+}

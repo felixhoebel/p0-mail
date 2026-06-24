@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Link } from "react-router-dom";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { Loader2, Settings, Search, RefreshCw, Archive, Trash2, MailOpen, Mail, PenSquare, Reply, CornerDownLeft, Sparkles, MessageSquare } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -23,6 +24,7 @@ import {
   streamDraftReply,
   onAiStream,
   onAiStreamError,
+  onMailSynced,
 } from "@/lib/api";
 import type { Account, Thread, Email, SendQueueItem, AiConfig, AiTone } from "@/types";
 import EmailViewer from "@/components/email/EmailViewer";
@@ -72,36 +74,6 @@ function dateGroup(ts: number): string {
   if (d >= weekAgo) return "This Week";
   if (d >= monthAgo) return "This Month";
   return d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
-}
-
-const AVATAR_COLORS = [
-  "bg-rose-500/15 text-rose-600 dark:text-rose-400",
-  "bg-orange-500/15 text-orange-600 dark:text-orange-400",
-  "bg-amber-500/15 text-amber-600 dark:text-amber-400",
-  "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
-  "bg-teal-500/15 text-teal-600 dark:text-teal-400",
-  "bg-sky-500/15 text-sky-600 dark:text-sky-400",
-  "bg-indigo-500/15 text-indigo-600 dark:text-indigo-400",
-  "bg-violet-500/15 text-violet-600 dark:text-violet-400",
-  "bg-fuchsia-500/15 text-fuchsia-600 dark:text-fuchsia-400",
-];
-
-function avatarColor(seed: string): string {
-  let hash = 0;
-  for (let i = 0; i < seed.length; i++) hash = seed.charCodeAt(i) + ((hash << 5) - hash);
-  return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
-}
-
-function initials(name: string): string {
-  const parts = name.split(/[\s@]+/).filter(Boolean);
-  if (parts.length === 0) return "?";
-  if (parts.length === 1) return parts[0][0].toUpperCase();
-  return (parts[0][0] + parts[1][0]).toUpperCase();
-}
-
-function senderName(email: Email): string {
-  const from = email.from?.[0];
-  return from?.name || from?.address || "Unknown";
 }
 
 function ThreadLabels({ thread }: { thread: Thread }) {
@@ -383,7 +355,7 @@ export default function InboxPage() {
   const [emails, setEmails] = useState<Email[]>([]);
   const [selectedEmail, setSelectedEmail] = useState<number | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<Email[]>([]);
+  const [searchResults, setSearchResults] = useState<Thread[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [composing, setComposing] = useState(false);
@@ -482,6 +454,21 @@ export default function InboxPage() {
 
   useEffect(() => {
     loadThreads();
+  }, [loadThreads]);
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    onMailSynced((event) => {
+      if (event.new_count > 0) {
+        loadThreads();
+        setStatusMessage(`${event.new_count} new email${event.new_count === 1 ? "" : "s"}`);
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
   }, [loadThreads]);
 
   const resetAiStream = useCallback(() => {
@@ -1060,25 +1047,37 @@ export default function InboxPage() {
                 <p className="text-sm text-muted-foreground">No results</p>
               </div>
             ) : (
-              searchResults.map((email) => {
-                const name = senderName(email);
+              searchResults.map((thread) => {
+                const selected = selectedThread === thread.id;
                 return (
                   <div
-                    key={email.id}
-                    onClick={() => {
-                      setSelectedThread(email.thread_id);
-                      setEmails([email]);
-                      setSelectedEmail(email.id);
-                      setIsSearching(false);
-                    }}
-                    className="flex items-start gap-2.5 px-3 py-2.5 cursor-pointer hover:bg-accent/50 transition-colors group"
+                    key={thread.id}
+                    onClick={() => handleSelectThread(thread)}
+                    className={`relative flex items-start gap-2.5 px-3 py-2.5 cursor-pointer transition-colors group ${
+                      selected ? "bg-accent" : "hover:bg-accent/50"
+                    }`}
                   >
-                    <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[11px] font-medium ${avatarColor(name)}`}>
-                      {initials(name)}
-                    </div>
+                    {selected && (
+                      <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-foreground" />
+                    )}
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm truncate">{email.subject || "(no subject)"}</p>
-                      <p className="text-xs text-muted-foreground truncate">{name}</p>
+                      <div className="flex items-center gap-1.5">
+                        {!thread.is_read && (
+                          <span className="h-1.5 w-1.5 rounded-full bg-ai shrink-0" />
+                        )}
+                        <p className={`text-sm truncate flex-1 ${!thread.is_read ? "font-semibold" : "text-muted-foreground"}`}>
+                          {thread.subject || "(no subject)"}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-1.5 mt-0.5">
+                        <p className="text-[11px] text-muted-foreground/80">
+                          {thread.message_count} {thread.message_count === 1 ? "msg" : "msgs"}
+                        </p>
+                        <span className="text-[11px] text-muted-foreground/40">·</span>
+                        <p className="text-[11px] text-muted-foreground/80">
+                          {formatDate(thread.latest_date)}
+                        </p>
+                      </div>
                     </div>
                   </div>
                 );

@@ -594,11 +594,11 @@ export default function SettingsPage() {
   };
 
   return (
-    <div className="h-full overflow-y-auto scrollbar-thin p-8 max-w-2xl">
+    <div className="h-full overflow-y-auto scrollbar-thin p-8">
       <h2 className="text-lg font-semibold mb-1">Settings</h2>
       <p className="text-sm text-muted-foreground mb-8">Manage your accounts and AI configuration.</p>
-
-      <Card className="mb-6 border-border">
+<div className="grid lg:grid-cols-2 gap-6">
+      <Card className="mb-6 border-border h-fit">
         <CardHeader>
           <CardTitle className="text-sm">Accounts</CardTitle>
         </CardHeader>
@@ -613,14 +613,14 @@ export default function SettingsPage() {
         </CardContent>
       </Card>
 
-      <Card className="border-violet-500/15">
+      <Card className="border-violet-500/15 h-fit">
         <CardHeader>
           <CardTitle className="text-sm">AI</CardTitle>
         </CardHeader>
         <CardContent>
           <AiConfigSection />
         </CardContent>
-      </Card>
+      </Card></div>
     </div>
   );
 }

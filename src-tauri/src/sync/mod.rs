@@ -8,6 +8,11 @@ use futures::StreamExt;
 const INITIAL_SYNC_LIMIT: u32 = 100;
 const MAX_EMAILS_PER_ACCOUNT: i64 = 100;
 
+pub struct AccountSyncResult {
+    pub account_id: i64,
+    pub new_count: i64,
+}
+
 pub struct SyncEngine;
 
 impl SyncEngine {
@@ -15,7 +20,7 @@ impl SyncEngine {
         SyncEngine
     }
 
-    pub async fn sync_account(&self, account_id: i64) -> Result<(), String> {
+    pub async fn sync_account(&self, account_id: i64) -> Result<i64, String> {
         let (provider_type, imap_host, imap_port, imap_encryption, email_address) = {
             let conn = db::get()?;
             conn.query_row(
@@ -66,7 +71,7 @@ impl SyncEngine {
                 .collect::<Vec<_>>()
                 .await
         } else if mailbox.exists == 0 {
-            return Ok(());
+            return Ok(0);
         } else {
             let seq_start = mailbox
                 .exists
@@ -243,14 +248,14 @@ impl SyncEngine {
             max_uid
         );
 
-        Ok(())
+        Ok(new_count)
     }
 
-    pub async fn sync_all(&self) -> Result<(), String> {
+    pub async fn sync_all(&self) -> Result<Vec<AccountSyncResult>, String> {
         let account_ids: Vec<i64> = {
             let conn = db::get()?;
             let mut stmt = conn
-                .prepare("SELECT id FROM accounts")
+                .prepare("SELECT id FROM accounts WHERE sync_enabled = 1")
                 .map_err(|e| e.to_string())?;
             let ids: Vec<i64> = stmt
                 .query_map([], |row| row.get(0))
@@ -260,16 +265,23 @@ impl SyncEngine {
             ids
         };
 
+        let mut results: Vec<AccountSyncResult> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
         for id in account_ids {
-            if let Err(e) = self.sync_account(id).await {
-                log::error!("Sync failed for account {}: {}", id, e);
-                errors.push(format!("Account {id}: {e}"));
+            match self.sync_account(id).await {
+                Ok(new_count) => results.push(AccountSyncResult {
+                    account_id: id,
+                    new_count,
+                }),
+                Err(e) => {
+                    log::error!("Sync failed for account {}: {}", id, e);
+                    errors.push(format!("Account {id}: {e}"));
+                }
             }
         }
 
         if errors.is_empty() {
-            Ok(())
+            Ok(results)
         } else {
             Err(errors.join("; "))
         }

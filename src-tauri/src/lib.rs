@@ -4,6 +4,7 @@ mod compose;
 mod db;
 mod email_parse;
 mod imap_client;
+mod notifications;
 mod oauth;
 mod search;
 mod secure;
@@ -13,6 +14,57 @@ mod threading;
 
 use commands::models;
 use serde::Deserialize;
+use std::sync::Arc;
+use std::time::Duration;
+use tauri::{Emitter, Manager, WindowEvent};
+
+const POLL_INTERVAL_SECS: u64 = 60;
+const POLL_JITTER_SECS: i64 = 10;
+const POLL_BACKOFF_SECS: u64 = 300;
+
+fn jittered_interval(base: u64) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let offset = (nanos % (2 * POLL_JITTER_SECS as u32)) as i64 - POLL_JITTER_SECS;
+    (base as i64 + offset).max(1) as u64
+}
+
+async fn run_poll_loop(app: tauri::AppHandle, wake: Arc<tokio::sync::Notify>) {
+    let engine = sync::SyncEngine::new();
+    let mut backoff = false;
+    loop {
+        let sleep_secs = if backoff {
+            POLL_BACKOFF_SECS
+        } else {
+            jittered_interval(POLL_INTERVAL_SECS)
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {}
+            _ = wake.notified() => {}
+        }
+        match engine.sync_all().await {
+            Ok(results) => {
+                backoff = false;
+                let account_ids: Vec<i64> = results.iter().map(|r| r.account_id).collect();
+                for r in &results {
+                    if r.new_count > 0 {
+                        let _ = app.emit(
+                            "mail-synced",
+                            serde_json::json!({"account_id": r.account_id, "new_count": r.new_count}),
+                        );
+                    }
+                }
+                notifications::notify_new_mail(&app, &account_ids);
+            }
+            Err(e) => {
+                log::error!("Background sync cycle failed: {}", e);
+                backoff = true;
+            }
+        }
+    }
+}
 
 fn decode_subject(value: Option<String>) -> Option<String> {
     value.map(|s| email_parse::decode_header(&s))
@@ -309,9 +361,26 @@ fn remove_account(account_id: i64) -> Result<(), String> {
 async fn trigger_sync(account_id: Option<i64>) -> Result<(), String> {
     let engine = sync::SyncEngine::new();
     match account_id {
-        Some(id) => engine.sync_account(id).await,
-        None => engine.sync_all().await,
+        Some(id) => {
+            engine.sync_account(id).await?;
+            Ok(())
+        }
+        None => {
+            engine.sync_all().await?;
+            Ok(())
+        }
     }
+}
+
+#[tauri::command]
+fn set_account_sync_enabled(account_id: i64, enabled: bool) -> Result<(), String> {
+    let conn = db::get()?;
+    conn.execute(
+        "UPDATE accounts SET sync_enabled = ?1 WHERE id = ?2",
+        rusqlite::params![enabled as i64, account_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -481,66 +550,64 @@ fn get_email(email_id: i64) -> Result<models::Email, String> {
 }
 
 #[tauri::command]
-fn search_emails(query: String) -> Result<Vec<models::Email>, String> {
+fn search_emails(query: String) -> Result<Vec<models::Thread>, String> {
     let service = search::SearchService::new();
-    let ids = service.search(&query, 50)?;
-    if ids.is_empty() {
+    let email_ids = service.search(&query, 50)?;
+    if email_ids.is_empty() {
         return Ok(vec![]);
     }
     let conn = db::get()?;
-    let placeholders: Vec<String> = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+    let placeholders: Vec<String> = email_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
     let sql = format!(
-        "SELECT id, thread_id, account_id, imap_uid, message_id, \
-         in_reply_to, \"references\", subject, from_json, to_json, \
-         cc_json, bcc_json, date_rfc2822, received_at, body_text, \
-         body_html, is_read, folder, attachments_meta, labels \
-         FROM emails WHERE id IN ({})",
+        "SELECT DISTINCT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
+         FROM threads t \
+         JOIN emails e ON e.thread_id = t.id \
+         WHERE e.id IN ({}) \
+         ORDER BY t.latest_date DESC",
         placeholders.join(",")
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let params: Vec<Box<dyn rusqlite::types::ToSql>> = ids
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = email_ids
         .iter()
         .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
         .collect();
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let emails: Vec<models::Email> = stmt
+    let threads: Vec<models::Thread> = stmt
         .query_map(param_refs.as_slice(), |row| {
-            let refs_str: Option<String> = row.get(6)?;
-            let refs: Option<Vec<String>> = refs_str.as_deref().and_then(|s| serde_json::from_str(s).ok());
-            let from_str: String = row.get(8)?;
-            let to_str: String = row.get(9)?;
-            let cc_str: Option<String> = row.get(10)?;
-            let bcc_str: Option<String> = row.get(11)?;
-            let att_str: Option<String> = row.get(18)?;
-            let labels_str: String = row.get(19)?;
-            let labels: Vec<String> = serde_json::from_str(&labels_str).unwrap_or_default();
-            Ok(models::Email {
+            Ok(models::Thread {
                 id: row.get(0)?,
-                thread_id: row.get(1)?,
-                account_id: row.get(2)?,
-                imap_uid: row.get(3)?,
-                message_id: row.get(4)?,
-                in_reply_to: row.get(5)?,
-                references_field: refs,
-                subject: decode_subject(row.get(7)?),
-                from_field: serde_json::from_str(&from_str).unwrap_or_default(),
-                to_field: serde_json::from_str(&to_str).unwrap_or_default(),
-                cc_field: cc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
-                bcc_field: bcc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
-                date_rfc2822: row.get(12)?,
-                received_at: row.get(13)?,
-                body_text: row.get(14)?,
-                body_html: row.get(15)?,
-                is_read: row.get::<_, i64>(16)? != 0,
-                folder: row.get(17)?,
-                labels,
-                attachments_meta: att_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+                account_id: row.get(1)?,
+                subject: decode_subject(row.get(2)?),
+                latest_date: row.get(3)?,
+                message_count: row.get(4)?,
+                is_read: row.get::<_, i64>(5)? != 0,
+                is_flagged: row.get::<_, i64>(6)? != 0,
             })
         })
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
-    Ok(emails)
+    Ok(threads)
+}
+
+#[tauri::command]
+fn reindex_account(account_id: i64) -> Result<(), String> {
+    let conn = db::get()?;
+    conn.execute(
+        "INSERT INTO emails_fts(emails_fts, rowid, subject, from_address, to_address, body_text, body_html_stripped) \
+         SELECT 'delete', id, subject, from_json, to_json, COALESCE(body_text, ''), COALESCE(body_text, '') \
+         FROM emails WHERE account_id = ?1",
+        rusqlite::params![account_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO emails_fts(rowid, subject, from_address, to_address, body_text, body_html_stripped) \
+         SELECT id, subject, from_json, to_json, COALESCE(body_text, ''), COALESCE(body_text, '') \
+         FROM emails WHERE account_id = ?1",
+        rusqlite::params![account_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1272,6 +1339,22 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            let wake = Arc::new(tokio::sync::Notify::new());
+            let wake_for_focus = wake.clone();
+            if let Some(window) = app.get_webview_window("main") {
+                window.on_window_event(move |event| {
+                    if let WindowEvent::Focused(true) = event {
+                        wake_for_focus.notify_one();
+                    }
+                });
+            }
+            tauri::async_runtime::spawn(async move {
+                run_poll_loop(handle, wake).await;
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_accounts,
             add_oauth_account,
@@ -1279,10 +1362,12 @@ pub fn run() {
             add_imap_account,
             remove_account,
             trigger_sync,
+            set_account_sync_enabled,
             list_threads,
             get_emails,
             get_email,
             search_emails,
+            reindex_account,
             mark_read,
             archive_email,
             delete_email,

@@ -51,6 +51,32 @@ export async function triggerSync(accountId?: number): Promise<void> {
   return invoke("trigger_sync", { accountId });
 }
 
+export async function setAccountSyncEnabled(
+  accountId: number,
+  enabled: boolean,
+): Promise<void> {
+  return invoke("set_account_sync_enabled", { accountId, enabled });
+}
+
+export interface MailSyncedEvent {
+  account_id: number;
+  new_count: number;
+}
+
+export function onMailSynced(
+  callback: (event: MailSyncedEvent) => void,
+): Promise<UnlistenFn> {
+  return listen("mail-synced", (e) =>
+    callback(e.payload as MailSyncedEvent),
+  );
+}
+
+export function onOpenThread(
+  callback: (threadId: number) => void,
+): Promise<UnlistenFn> {
+  return listen("open-thread", (e) => callback(Number(e.payload)));
+}
+
 // Threads & Emails
 export async function listThreads(params: {
   accountId?: number;
@@ -69,8 +95,12 @@ export async function getEmail(emailId: number): Promise<Email> {
 }
 
 // Search
-export async function searchEmails(query: string): Promise<Email[]> {
+export async function searchEmails(query: string): Promise<Thread[]> {
   return invoke("search_emails", { query });
+}
+
+export async function reindexAccount(accountId: number): Promise<void> {
+  return invoke("reindex_account", { accountId });
 }
 
 // Mail Actions
