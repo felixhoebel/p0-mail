@@ -17,6 +17,30 @@ pub struct ParsedBodies {
     pub html: Option<String>,
 }
 
+fn sanitize_html(html: &str) -> String {
+    ammonia::Builder::new()
+        .tags(std::collections::HashSet::from([
+            "a", "b", "br", "blockquote", "code", "div", "em", "h1", "h2", "h3",
+            "hr", "i", "img", "li", "ol", "p", "pre", "span", "strong", "table",
+            "tbody", "td", "th", "thead", "tr", "ul", "font", "center",
+        ]))
+        .tag_attributes(std::collections::HashMap::from([
+            ("a", std::collections::HashSet::from(["href"])),
+            ("img", std::collections::HashSet::from(["src", "alt", "width", "height"])),
+            ("td", std::collections::HashSet::from(["colspan", "rowspan", "align", "valign", "bgcolor"])),
+            ("th", std::collections::HashSet::from(["colspan", "rowspan", "align", "valign", "bgcolor"])),
+            ("table", std::collections::HashSet::from(["width", "border", "cellpadding", "cellspacing", "align"])),
+            ("font", std::collections::HashSet::from(["color", "size", "face"])),
+            ("div", std::collections::HashSet::from(["align"])),
+            ("p", std::collections::HashSet::from(["align"])),
+            ("hr", std::collections::HashSet::from(["width", "align"])),
+        ]))
+        .link_rel(Some("noopener noreferrer"))
+        .strip_comments(true)
+        .clean(html)
+        .to_string()
+}
+
 pub fn extract_bodies(raw: &[u8]) -> Result<ParsedBodies, String> {
     let parsed = mailparse::parse_mail(raw).map_err(|e| format!("MIME parse failed: {e}"))?;
     let mut text = None;
@@ -65,9 +89,10 @@ pub fn store_bodies(
     bodies: &ParsedBodies,
 ) -> Result<(), String> {
     let conn = crate::db::get()?;
+    let sanitized_html = bodies.html.as_ref().map(|h| sanitize_html(h));
     conn.execute(
         "UPDATE emails SET body_html = ?1, body_text = ?2 WHERE id = ?3",
-        rusqlite::params![bodies.html, bodies.text, email_id],
+        rusqlite::params![sanitized_html, bodies.text, email_id],
     )
     .map_err(|e| format!("Failed to update email body: {e}"))?;
     Ok(())
@@ -168,5 +193,57 @@ mod tests {
         let bodies = extract_bodies(raw.as_bytes()).unwrap();
         assert_eq!(bodies.text.as_deref(), Some("Hello plain"));
         assert!(bodies.html.as_ref().unwrap().contains("Hello html"));
+    }
+
+    #[test]
+    fn sanitizes_script_tags() {
+        let html = r#"<p>Hello</p><script>alert('xss')</script>"#;
+        let clean = sanitize_html(html);
+        assert!(clean.contains("Hello"));
+        assert!(!clean.contains("script"));
+        assert!(!clean.contains("alert"));
+    }
+
+    #[test]
+    fn sanitizes_inline_event_handlers() {
+        let html = r#"<p onclick="steal()" onerror="x()">Text</p>"#;
+        let clean = sanitize_html(html);
+        assert!(clean.contains("Text"));
+        assert!(!clean.contains("onclick"));
+        assert!(!clean.contains("onerror"));
+    }
+
+    #[test]
+    fn sanitizes_style_tags() {
+        let html = r#"<style>@import url(http://evil/track.css)</style><p>Hi</p>"#;
+        let clean = sanitize_html(html);
+        assert!(clean.contains("Hi"));
+        assert!(!clean.contains("style"));
+        assert!(!clean.contains("@import"));
+    }
+
+    #[test]
+    fn sanitizes_javascript_uris() {
+        let html = r#"<a href="javascript:alert(1)">click</a>"#;
+        let clean = sanitize_html(html);
+        assert!(clean.contains("click"));
+        assert!(!clean.contains("javascript:"));
+    }
+
+    #[test]
+    fn preserves_safe_links() {
+        let html = r#"<a href="https://example.com">link</a>"#;
+        let clean = sanitize_html(html);
+        assert!(clean.contains("https://example.com"));
+        assert!(clean.contains("link"));
+    }
+
+    #[test]
+    fn strips_iframe_and_object() {
+        let html = r#"<iframe src="evil"></iframe><object data="x"></object><p>safe</p>"#;
+        let clean = sanitize_html(html);
+        assert!(clean.contains("safe"));
+        assert!(!clean.contains("iframe"));
+        assert!(!clean.contains("object"));
     }
 }

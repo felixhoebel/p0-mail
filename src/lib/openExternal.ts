@@ -2,7 +2,12 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 
 export function resolveEmailLink(href: string): string | null {
   const trimmed = href.trim();
-  if (!trimmed || trimmed === "#" || /^javascript:/i.test(trimmed)) {
+  if (!trimmed || trimmed === "#") {
+    return null;
+  }
+  const normalized = trimmed.replace(/[\x00-\x20]+/g, "").toLowerCase();
+  const scheme = normalized.split(":")[0];
+  if (["javascript", "vbscript", "data", "file"].includes(scheme)) {
     return null;
   }
   if (/^(https?:|mailto:|tel:)/i.test(trimmed)) {

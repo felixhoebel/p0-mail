@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useState, useRef, useEffect } from "react";
 import DOMPurify from "dompurify";
 import { openExternalUrl, resolveEmailLink } from "@/lib/openExternal";
 import type { Email } from "@/types";
@@ -44,19 +44,15 @@ const SANITIZE_CONFIG = {
   ALLOWED_TAGS: [
     "a", "b", "br", "blockquote", "code", "div", "em", "h1", "h2", "h3",
     "hr", "i", "img", "li", "ol", "p", "pre", "span", "strong", "table",
-    "tbody", "td", "th", "thead", "tr", "ul", "font", "center", "style",
+    "tbody", "td", "th", "thead", "tr", "ul", "font", "center",
   ],
   ALLOWED_ATTR: [
-    "href", "style", "class", "width", "height", "align", "valign",
+    "href", "class", "width", "height", "align", "valign",
     "bgcolor", "color", "size", "face", "cellpadding", "cellspacing",
-    "border", "colspan", "rowspan",
+    "border", "colspan", "rowspan", "src", "alt",
   ],
   ALLOW_DATA_ATTR: false,
-  FORBID_TAGS: [
-    "script", "iframe", "object", "embed", "form", "input", "textarea", "select",
-    "base", "meta",
-  ],
-  FORBID_ATTR: ["onerror", "onload", "onclick", "onmouseover"],
+  ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel|data:image\/(?:png|gif|jpeg|jpg|webp);base64,)|cid:)/i,
 };
 
 function hardenEmailLinks(node: Element) {
@@ -113,6 +109,7 @@ function initials(name: string): string {
 
 export default function EmailViewer({ email }: EmailViewerProps) {
   const [showImages, setShowImages] = useState(false);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
 
   const hasBody = Boolean(email.body_html || email.body_text);
 
@@ -128,15 +125,16 @@ export default function EmailViewer({ email }: EmailViewerProps) {
     return clean;
   }, [email.body_html, email.body_text, showImages, hasBody]);
 
-  const handleBodyClick = useCallback(async (e: React.MouseEvent<HTMLDivElement>) => {
-    const anchor = (e.target as HTMLElement).closest("a");
+  const handleClickInIframe = useCallback(async (e: MouseEvent) => {
+    const target = e.target as HTMLElement;
+    const anchor = target.closest("a");
     if (!anchor) return;
+    e.preventDefault();
+    e.stopPropagation();
     const href = anchor.getAttribute("href");
     if (!href) return;
     const url = resolveEmailLink(href);
     if (!url) return;
-    e.preventDefault();
-    e.stopPropagation();
     await openExternalUrl(url);
   }, []);
 
@@ -146,6 +144,63 @@ export default function EmailViewer({ email }: EmailViewerProps) {
   }, [email.body_html]);
 
   const senderName = email.from?.[0]?.name || email.from?.[0]?.address || "Unknown";
+
+  const iframeDoc = useMemo(() => {
+    return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<base target="_blank">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; color: hsl(var(--foreground)); background: hsl(var(--background)); font-size: 14px; line-height: 1.6; margin: 0; padding: 0; word-wrap: break-word; }
+  a { color: #7c3aed; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  img { max-width: 100%; height: auto; }
+  table { border-collapse: collapse; max-width: 100%; }
+  pre { overflow-x: auto; }
+  .blocked-image { border: 1px dashed #999; padding: 8px; margin: 4px 0; color: #999; font-size: 12px; border-radius: 4px; }
+  blockquote { border-left: 3px solid hsl(var(--border)); margin: 0; padding-left: 12px; color: hsl(var(--muted-foreground)); }
+</style>
+</head>
+<body>${sanitizedHtml}</body>
+</html>`;
+  }, [sanitizedHtml]);
+
+  useEffect(() => {
+    const iframe = iframeRef.current;
+    if (!iframe) return;
+    iframe.srcdoc = iframeDoc;
+  }, [iframeDoc]);
+
+  useEffect(() => {
+    const iframe = iframeRef.current;
+    if (!iframe) return;
+
+    const handleLoad = () => {
+      try {
+        const doc = iframe.contentDocument;
+        if (!doc) return;
+        doc.addEventListener("click", handleClickInIframe);
+
+        const body = doc.body;
+        const resize = () => {
+          iframe.style.height = `${body.scrollHeight + 20}px`;
+        };
+        resize();
+        const observer = new MutationObserver(resize);
+        observer.observe(body, { childList: true, subtree: true, attributes: true });
+        return () => {
+          doc.removeEventListener("click", handleClickInIframe);
+          observer.disconnect();
+        };
+      } catch {
+        // cross-origin — skip
+      }
+    };
+
+    iframe.addEventListener("load", handleLoad);
+    return () => iframe.removeEventListener("load", handleLoad);
+  }, [handleClickInIframe, iframeDoc]);
 
   return (
     <div className="flex flex-col">
@@ -203,12 +258,14 @@ export default function EmailViewer({ email }: EmailViewerProps) {
         )}
       </div>
 
-      {/* Email body */}
+      {/* Email body — sandboxed iframe for isolation */}
       <div className="px-6 pb-6 pt-1">
-        <div
-          className="prose prose-sm max-w-none prose-headings:font-semibold prose-a:text-violet-600 prose-a:no-underline hover:prose-a:underline prose-blockquote:border-l-muted-foreground/30"
-          onClick={handleBodyClick}
-          dangerouslySetInnerHTML={{ __html: sanitizedHtml }}
+        <iframe
+          ref={iframeRef}
+          sandbox="allow-same-origin"
+          className="w-full border-0"
+          style={{ minHeight: "200px" }}
+          title="Email content"
         />
       </div>
     </div>
