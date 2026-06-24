@@ -661,19 +661,35 @@ export default function InboxPage() {
 
   const handleArchive = useCallback(async (emailId: number) => {
     await archiveEmail(emailId).catch(console.error);
-    setThreads((prev) => prev.filter((t) => t.id !== selectedThread));
-    setSelectedThread(null);
-    setSelectedEmail(null);
-    setEmails([]);
+    if (selectedThread) {
+      const remaining = await getEmails(selectedThread).catch(() => []);
+      if (remaining.length === 0) {
+        setThreads((prev) => prev.filter((t) => t.id !== selectedThread));
+        setSelectedThread(null);
+        setSelectedEmail(null);
+        setEmails([]);
+      } else {
+        setEmails(remaining);
+        setSelectedEmail(remaining[remaining.length - 1].id);
+      }
+    }
     loadThreads();
   }, [selectedThread, loadThreads]);
 
   const handleDelete = useCallback(async (emailId: number) => {
     await deleteEmail(emailId).catch(console.error);
-    setThreads((prev) => prev.filter((t) => t.id !== selectedThread));
-    setSelectedThread(null);
-    setSelectedEmail(null);
-    setEmails([]);
+    if (selectedThread) {
+      const remaining = await getEmails(selectedThread).catch(() => []);
+      if (remaining.length === 0) {
+        setThreads((prev) => prev.filter((t) => t.id !== selectedThread));
+        setSelectedThread(null);
+        setSelectedEmail(null);
+        setEmails([]);
+      } else {
+        setEmails(remaining);
+        setSelectedEmail(remaining[remaining.length - 1].id);
+      }
+    }
     loadThreads();
   }, [selectedThread, loadThreads]);
 
@@ -810,6 +826,11 @@ export default function InboxPage() {
             for (const em of fetched) {
               await archiveEmail(em.id).catch(() => {});
             }
+            if (selectedThread === thread.id) {
+              setSelectedThread(null);
+              setSelectedEmail(null);
+              setEmails([]);
+            }
             loadThreads();
           },
         },
@@ -822,12 +843,17 @@ export default function InboxPage() {
             for (const em of fetched) {
               await deleteEmail(em.id).catch(() => {});
             }
+            if (selectedThread === thread.id) {
+              setSelectedThread(null);
+              setSelectedEmail(null);
+              setEmails([]);
+            }
             loadThreads();
           },
         },
       ]);
     },
-    [ctxMenu, aiConfig, online, handleChatAbout, handleSelectThread, loadThreads],
+    [ctxMenu, aiConfig, online, handleChatAbout, handleSelectThread, loadThreads, selectedThread],
   );
 
   const handleEmailContextMenu = useCallback(
