@@ -12,6 +12,7 @@ import {
   addOauthAccount,
   addImapAccount,
   removeAccount,
+  reauthOauthAccount,
   validateImapConnection,
   getAiConfig,
   setAiConfig,
@@ -24,9 +25,13 @@ import { AI_OUTPUT_LANGUAGES } from "@/lib/aiUi";
 function AccountList({
   accounts,
   onRemove,
+  onReauth,
+  reauthingId,
 }: {
   accounts: Account[];
   onRemove: (id: number) => void;
+  onReauth: (id: number) => void;
+  reauthingId: number | null;
 }) {
   if (accounts.length === 0) {
     return (
@@ -35,31 +40,47 @@ function AccountList({
   }
   return (
     <div className="space-y-2">
-      {accounts.map((account) => (
-        <div
-          key={account.id}
-          className="flex items-center justify-between rounded-md border px-3 py-2"
-        >
-          <div>
-            <span className="text-sm font-medium">{account.email_address}</span>
-            <span className="ml-2 text-xs text-muted-foreground">
-              ({account.display_name})
-            </span>
-            {account.needs_reauth && (
-              <p className="text-xs text-amber-600 mt-1">
-                Session expired — remove and connect Google again.
-              </p>
-            )}
-          </div>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => onRemove(account.id)}
+      {accounts.map((account) => {
+        const isOAuth = account.provider_type === "gmail_oauth" || account.provider_type === "microsoft_oauth";
+        const showReconnect = isOAuth && (account.needs_reauth || reauthingId === account.id);
+        return (
+          <div
+            key={account.id}
+            className="flex items-center justify-between rounded-md border px-3 py-2"
           >
-            Remove
-          </Button>
-        </div>
-      ))}
+            <div>
+              <span className="text-sm font-medium">{account.email_address}</span>
+              <span className="ml-2 text-xs text-muted-foreground">
+                ({account.display_name})
+              </span>
+              {showReconnect && (
+                <p className="text-xs text-amber-600 mt-1">
+                  Session expired — reconnect to continue syncing.
+                </p>
+              )}
+            </div>
+            <div className="flex items-center gap-1">
+              {showReconnect && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => onReauth(account.id)}
+                  disabled={reauthingId !== null}
+                >
+                  {reauthingId === account.id ? "Connecting…" : "Reconnect"}
+                </Button>
+              )}
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => onRemove(account.id)}
+              >
+                Remove
+              </Button>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -471,6 +492,7 @@ function AiConfigSection() {
 
 export default function SettingsPage() {
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [reauthingId, setReauthingId] = useState<number | null>(null);
 
   const loadAccounts = () => {
     listAccounts().then(setAccounts).catch(console.error);
@@ -489,6 +511,20 @@ export default function SettingsPage() {
     }
   };
 
+  const handleReauth = async (id: number) => {
+    setReauthingId(id);
+    try {
+      await reauthOauthAccount(id);
+      await triggerSync(id).catch(() => {});
+      loadAccounts();
+    } catch (e) {
+      console.error(e);
+      alert(String(e));
+    } finally {
+      setReauthingId(null);
+    }
+  };
+
   return (
     <div className="h-full overflow-y-auto scrollbar-thin p-8 max-w-2xl">
       <h2 className="text-lg font-semibold mb-1">Settings</h2>
@@ -499,7 +535,12 @@ export default function SettingsPage() {
           <CardTitle className="text-sm">Accounts</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <AccountList accounts={accounts} onRemove={handleRemove} />
+          <AccountList
+            accounts={accounts}
+            onRemove={handleRemove}
+            onReauth={handleReauth}
+            reauthingId={reauthingId}
+          />
           <AddAccountSection onAccountAdded={loadAccounts} />
         </CardContent>
       </Card>

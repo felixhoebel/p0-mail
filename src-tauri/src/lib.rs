@@ -203,6 +203,95 @@ fn add_imap_account(params: ImapAccountParams) -> Result<models::Account, String
 }
 
 #[tauri::command]
+async fn reauth_oauth_account(
+    _app: tauri::AppHandle,
+    account_id: i64,
+) -> Result<models::Account, String> {
+    let (provider_type, stored_email) = {
+        let conn = db::get()?;
+        conn.query_row(
+            "SELECT provider_type, email_address FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|e| format!("Account not found: {}", e))?
+    };
+
+    let oauth_provider = oauth::OAuthProvider::from_str(&provider_type)
+        .ok_or_else(|| format!("Account {} is not an OAuth account", account_id))?;
+
+    if oauth_provider.client_id().is_empty() {
+        return Err(format!(
+            "OAuth client ID not configured for {}.",
+            oauth_provider.display_name()
+        ));
+    }
+
+    let port = oauth::find_available_port()?;
+    let state = oauth::generate_state();
+    let flow = oauth::OAuthFlow::new(oauth_provider.clone());
+
+    let rx = flow.listen_for_callback(port, state.clone())?;
+
+    let auth_url = flow.authorization_url(port, &state);
+
+    tauri_plugin_opener::open_url(&auth_url, None::<&str>)
+        .map_err(|e| format!("Failed to open browser: {}", e))?;
+
+    let (code, _redirect_port) = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .map_err(|_| "OAuth flow timed out after 120 seconds".to_string())?
+        .map_err(|e| format!("OAuth callback error: {}", e))?;
+
+    let tokens = flow.exchange_code(&code, port).await?;
+
+    secure::store_access_token(account_id, &tokens.access_token)?;
+    if let Some(refresh_token) = &tokens.refresh_token {
+        secure::store_refresh_token(account_id, refresh_token)?;
+    }
+
+    let email = tokens
+        .email
+        .clone()
+        .unwrap_or_else(|| stored_email.clone());
+
+    if email != stored_email {
+        let conn = db::get()?;
+        conn.execute(
+            "UPDATE accounts SET email_address = ?1 WHERE id = ?2",
+            rusqlite::params![email, account_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let (row,): (i64,) = {
+        let conn = db::get()?;
+        conn.query_row(
+            "SELECT last_seen_uid FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+            |row| Ok((row.get::<_, i64>(0)?,)),
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    Ok(models::Account {
+        id: account_id,
+        provider_type: oauth_provider.as_str().to_string(),
+        display_name: oauth_provider.display_name().to_string(),
+        email_address: email,
+        imap_host: Some(oauth_provider.imap_host().to_string()),
+        imap_port: Some(oauth_provider.imap_port()),
+        imap_encryption: Some(oauth_provider.imap_encryption().to_string()),
+        smtp_host: Some(oauth_provider.smtp_host().to_string()),
+        smtp_port: Some(oauth_provider.smtp_port()),
+        smtp_encryption: Some(oauth_provider.smtp_encryption().to_string()),
+        last_seen_uid: row,
+        created_at: chrono::Utc::now().timestamp(),
+        needs_reauth: false,
+    })
+}
+
+#[tauri::command]
 fn remove_account(account_id: i64) -> Result<(), String> {
     let conn = db::get()?;
     conn.execute(
@@ -1128,6 +1217,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_accounts,
             add_oauth_account,
+            reauth_oauth_account,
             add_imap_account,
             remove_account,
             trigger_sync,

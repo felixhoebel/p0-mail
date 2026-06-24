@@ -42,6 +42,10 @@ export async function removeAccount(accountId: number): Promise<void> {
   return invoke("remove_account", { accountId });
 }
 
+export async function reauthOauthAccount(accountId: number): Promise<Account> {
+  return invoke("reauth_oauth_account", { accountId });
+}
+
 // Sync
 export async function triggerSync(accountId?: number): Promise<void> {
   return invoke("trigger_sync", { accountId });

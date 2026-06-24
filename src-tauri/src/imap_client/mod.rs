@@ -42,13 +42,44 @@ impl ImapConnection {
 
         match session {
             Ok(s) => Ok(s),
-            Err(_) => {
+            Err(_first_err) => {
                 log::warn!("XOAUTH2 login failed, attempting token refresh");
-                let refresh_token = secure::get_refresh_token(account_id)?;
-                let new_tokens = refresh_access_token(provider, &refresh_token).await?;
+
+                let refresh_token = match secure::get_refresh_token(account_id) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        return Err(format!(
+                            "OAuth session expired and no refresh token found. \
+                             Please reconnect your {} account in Settings.",
+                            provider.display_name()
+                        ));
+                    }
+                };
+
+                let new_tokens = match refresh_access_token(provider, &refresh_token).await {
+                    Ok(t) => t,
+                    Err(refresh_err) => {
+                        return Err(format!(
+                            "OAuth token refresh failed: {}. \
+                             Please reconnect your {} account in Settings.",
+                            refresh_err,
+                            provider.display_name()
+                        ));
+                    }
+                };
+
                 secure::store_access_token(account_id, &new_tokens.access_token)?;
 
-                Self::connect_and_auth_oauth(provider, &email, &new_tokens.access_token).await
+                Self::connect_and_auth_oauth(provider, &email, &new_tokens.access_token)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "IMAP XOAUTH2 auth failed after refresh: {:?}. \
+                             Please reconnect your {} account in Settings.",
+                            e,
+                            provider.display_name()
+                        )
+                    })
             }
         }
     }
