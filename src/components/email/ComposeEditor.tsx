@@ -5,7 +5,6 @@ import { Sparkles, X, CornerDownLeft } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { AiTone } from "@/types";
-import type { AiOutputLanguage } from "@/types";
 import AiInlineToolbar from "@/components/ai/AiInlineToolbar";
 
 interface ComposeEditorProps {
@@ -19,7 +18,6 @@ interface ComposeEditorProps {
   references?: string[];
   aiEnabled?: boolean;
   aiTone?: AiTone;
-  outputLanguage?: AiOutputLanguage;
   onSend: (params: {
     accountId: number;
     to: string;
@@ -46,7 +44,6 @@ export default function ComposeEditor({
   references,
   aiEnabled,
   aiTone = "Professional",
-  outputLanguage: _outputLanguage = "en",
   onSend,
   onCancel,
   sending,

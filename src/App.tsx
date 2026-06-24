@@ -1,11 +1,12 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, Suspense, lazy } from "react";
 import { Link, useLocation } from "react-router-dom";
-import { Mail, Settings, Moon, Sun } from "lucide-react";
+import { Mail, Settings, Moon, Sun, Loader2 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import InboxPage from "@/pages/InboxPage";
-import SettingsPage from "@/pages/SettingsPage";
-import OnboardingFlow from "@/components/onboarding/OnboardingFlow";
 import { listAccounts } from "@/lib/api";
+
+const SettingsPage = lazy(() => import("@/pages/SettingsPage"));
+const OnboardingFlow = lazy(() => import("@/components/onboarding/OnboardingFlow"));
 
 function ThemeToggle() {
   const [dark, setDark] = useState(false);
@@ -97,7 +98,11 @@ function App() {
   }
 
   if (onboarding) {
-    return <OnboardingFlow onComplete={() => setOnboarding(false)} />;
+    return (
+      <Suspense fallback={<div className="flex h-screen w-screen items-center justify-center bg-background"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>}>
+        <OnboardingFlow onComplete={() => setOnboarding(false)} />
+      </Suspense>
+    );
   }
 
   return (
@@ -118,9 +123,13 @@ function App() {
         <div className={onInbox ? "h-full" : "hidden"}>
           <InboxPage />
         </div>
-        <div className={onInbox ? "hidden" : "h-full"}>
-          <SettingsPage />
-        </div>
+        {!onInbox && (
+          <div className="h-full">
+            <Suspense fallback={<div className="flex h-full items-center justify-center"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>}>
+              <SettingsPage />
+            </Suspense>
+          </div>
+        )}
       </main>
     </div>
   );

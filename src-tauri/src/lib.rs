@@ -881,19 +881,6 @@ async fn stream_draft_reply(
 }
 
 #[tauri::command]
-async fn stream_polish_compose(
-    app: tauri::AppHandle,
-    stream_id: String,
-    subject: String,
-    draft: String,
-    tone: String,
-) -> Result<(), String> {
-    ai::AiService::new()
-        .stream_polish_compose(&app, &stream_id, &tone, &subject, &draft)
-        .await
-}
-
-#[tauri::command]
 async fn stream_ai_transform(
     app: tauri::AppHandle,
     stream_id: String,
@@ -1163,7 +1150,6 @@ pub fn run() {
             validate_ai_endpoint,
             stream_summarize_thread,
             stream_draft_reply,
-            stream_polish_compose,
             stream_ai_transform,
             is_online,
             validate_imap_connection,

@@ -99,39 +99,3 @@ const THINKING_LABELS: Record<AiOutputLanguage, AiThinkingLabels> = {
 export function getAiThinkingLabels(language: AiOutputLanguage): AiThinkingLabels {
   return THINKING_LABELS[language] ?? THINKING_LABELS.en;
 }
-
-export type ComposePolishLabels = {
-  polish: string;
-  polishing: string;
-  polishTitle: string;
-  polishHint: string;
-  minDraftError: string;
-};
-
-const COMPOSE_POLISH_LABELS: Record<AiOutputLanguage, ComposePolishLabels> = {
-  de: {
-    polish: "Mit KI ausformulieren",
-    polishing: "Formuliere aus…",
-    polishTitle: "Rohentwurf von der KI zu einer fertigen E-Mail ausbauen",
-    polishHint: "Stichpunkte oder Rohtext eingeben, dann ausformulieren lassen.",
-    minDraftError: "Schreib zuerst einen kurzen Entwurf.",
-  },
-  en: {
-    polish: "Polish with AI",
-    polishing: "Polishing…",
-    polishTitle: "Expand your rough draft into a finished email with AI",
-    polishHint: "Type bullet points or rough text, then polish.",
-    minDraftError: "Write a short draft first.",
-  },
-  no: {
-    polish: "Formuler med AI",
-    polishing: "Formulerer…",
-    polishTitle: "Utvid kladdet til en ferdig e-post med AI",
-    polishHint: "Skriv stikkord eller grov tekst, deretter formuler.",
-    minDraftError: "Skriv et kort utkast først.",
-  },
-};
-
-export function getComposePolishLabels(language: AiOutputLanguage): ComposePolishLabels {
-  return COMPOSE_POLISH_LABELS[language] ?? COMPOSE_POLISH_LABELS.en;
-}

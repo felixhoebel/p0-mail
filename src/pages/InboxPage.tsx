@@ -57,6 +57,21 @@ function formatDate(ts: number): string {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+function dateGroup(ts: number): string {
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const yesterday = new Date(today.getTime() - 86400000);
+  const weekAgo = new Date(today.getTime() - 7 * 86400000);
+  const monthAgo = new Date(today.getTime() - 30 * 86400000);
+
+  if (d >= today) return "Today";
+  if (d >= yesterday) return "Yesterday";
+  if (d >= weekAgo) return "This Week";
+  if (d >= monthAgo) return "This Month";
+  return d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+
 const AVATAR_COLORS = [
   "bg-rose-500/15 text-rose-600 dark:text-rose-400",
   "bg-orange-500/15 text-orange-600 dark:text-orange-400",
@@ -385,11 +400,14 @@ export default function InboxPage() {
 
   const [aiDraftBody, setAiDraftBody] = useState<string | null>(null);
 
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
   const aiTone = (aiConfig?.default_tone || "Professional") as AiTone;
   const aiLanguage = aiConfig?.output_language || "en";
   const aiActionLabels = getAiActionLabels(aiLanguage);
   const aiPanelLabels = getAiPanelLabels(aiLanguage);
   const aiThinkingLabels = getAiThinkingLabels(aiLanguage);
+  const unreadCount = threads.filter((t) => !t.is_read).length;
 
   const activeStreamIdRef = useRef<string | null>(null);
   const activeStreamKindRef = useRef<"summary" | "reply" | null>(null);
@@ -704,6 +722,46 @@ export default function InboxPage() {
     openReplyComposer(lastEmail);
   };
 
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) return;
+      if (composing || showInlineReply || aiDraftLoading || aiSummaryLoading) return;
+
+      if (e.key === "j" || e.key === "ArrowDown") {
+        e.preventDefault();
+        const idx = threads.findIndex((t) => t.id === selectedThread);
+        const next = threads[Math.min(idx + 1, threads.length - 1)];
+        if (next) handleSelectThread(next);
+      } else if (e.key === "k" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const idx = threads.findIndex((t) => t.id === selectedThread);
+        const prev = threads[Math.max(idx - 1, 0)];
+        if (prev) handleSelectThread(prev);
+      } else if (e.key === "r" && selectedEmailData) {
+        e.preventDefault();
+        handleManualReply();
+      } else if (e.key === "c") {
+        e.preventDefault();
+        setComposing(true);
+      } else if (e.key === "s" && selectedThread && aiConfig) {
+        e.preventDefault();
+        handleSummarize();
+      } else if (e.key === "e" && selectedEmailData) {
+        e.preventDefault();
+        archiveEmail(selectedEmailData.id).catch(console.error);
+      } else if ((e.key === "#" || e.key === "Delete") && selectedEmailData) {
+        e.preventDefault();
+        deleteEmail(selectedEmailData.id).catch(console.error);
+      } else if (e.key === "/") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [threads, selectedThread, selectedEmailData, composing, showInlineReply, aiDraftLoading, aiSummaryLoading, aiConfig]);
+
   return (
     <div className="flex h-full">
       {/* Thread list */}
@@ -713,6 +771,7 @@ export default function InboxPage() {
           <div className="relative flex-1">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/60" />
             <Input
+              ref={searchInputRef}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleSearch()}
@@ -738,6 +797,14 @@ export default function InboxPage() {
             <span className={`h-1.5 w-1.5 rounded-full ${online ? "bg-emerald-500" : "bg-red-500"}`} />
             {online ? "Online" : "Offline"}
           </span>
+          {unreadCount > 0 && (
+            <>
+              <span className="text-[11px] text-muted-foreground/50">·</span>
+              <span className="text-[11px] text-muted-foreground">
+                {unreadCount} unread
+              </span>
+            </>
+          )}
           {pendingQueueCount > 0 && (
             <>
               <span className="text-[11px] text-muted-foreground/50">·</span>
@@ -823,7 +890,7 @@ export default function InboxPage() {
             <div className="flex flex-col items-center justify-center py-16 px-4 text-center">
               <Mail className="h-6 w-6 text-muted-foreground/30 mb-3" />
               <p className="text-sm text-muted-foreground mb-1">No accounts yet</p>
-              <Link to="/settings" className="text-xs text-violet-500 hover:text-violet-400">
+              <Link to="/settings" className="text-xs text-ai hover:text-ai/80">
                 Add one in Settings →
               </Link>
             </div>
@@ -834,44 +901,56 @@ export default function InboxPage() {
               <p className="text-xs text-muted-foreground/70 mt-1">Sync to fetch emails</p>
             </div>
           ) : (
-            threads.map((thread) => {
-              const selected = selectedThread === thread.id;
-              return (
-                <div
-                  key={thread.id}
-                  onClick={() => handleSelectThread(thread)}
-                  className={`flex items-start gap-2.5 px-3 py-2.5 cursor-pointer transition-colors group ${
-                    selected
-                      ? "bg-accent"
-                      : "hover:bg-accent/50"
-                  }`}
-                >
-                  {selected && (
-                    <div className="absolute left-0 w-0.5 h-8 bg-foreground rounded-r" />
-                  )}
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-1.5">
-                      {!thread.is_read && (
-                        <span className="h-1.5 w-1.5 rounded-full bg-violet-500 shrink-0" />
+            (() => {
+              let currentGroup = "";
+              return threads.map((thread) => {
+                const group = dateGroup(thread.latest_date);
+                const showHeader = group !== currentGroup;
+                currentGroup = group;
+                const selected = selectedThread === thread.id;
+                return (
+                  <div key={thread.id}>
+                    {showHeader && (
+                      <div className="px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/60">
+                        {group}
+                      </div>
+                    )}
+                    <div
+                      onClick={() => handleSelectThread(thread)}
+                      className={`relative flex items-start gap-2.5 px-3 py-2.5 cursor-pointer transition-colors group ${
+                        selected
+                          ? "bg-accent"
+                          : "hover:bg-accent/50"
+                      }`}
+                    >
+                      {selected && (
+                        <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-foreground" />
                       )}
-                      <ThreadLabels thread={thread} />
-                      <p className={`text-sm truncate flex-1 ${!thread.is_read ? "font-semibold" : "text-muted-foreground"}`}>
-                        {thread.subject || "(no subject)"}
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-1.5 mt-0.5">
-                      <p className="text-[11px] text-muted-foreground/80">
-                        {thread.message_count} {thread.message_count === 1 ? "msg" : "msgs"}
-                      </p>
-                      <span className="text-[11px] text-muted-foreground/40">·</span>
-                      <p className="text-[11px] text-muted-foreground/80">
-                        {formatDate(thread.latest_date)}
-                      </p>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          {!thread.is_read && (
+                            <span className="h-1.5 w-1.5 rounded-full bg-ai shrink-0" />
+                          )}
+                          <ThreadLabels thread={thread} />
+                          <p className={`text-sm truncate flex-1 ${!thread.is_read ? "font-semibold" : "text-muted-foreground"}`}>
+                            {thread.subject || "(no subject)"}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-1.5 mt-0.5">
+                          <p className="text-[11px] text-muted-foreground/80">
+                            {thread.message_count} {thread.message_count === 1 ? "msg" : "msgs"}
+                          </p>
+                          <span className="text-[11px] text-muted-foreground/40">·</span>
+                          <p className="text-[11px] text-muted-foreground/80">
+                            {formatDate(thread.latest_date)}
+                          </p>
+                        </div>
+                      </div>
                     </div>
                   </div>
-                </div>
-              );
-            })
+                );
+              });
+            })()
           )}
         </div>
       </div>
@@ -960,13 +1039,13 @@ export default function InboxPage() {
 
             {/* AI nudge */}
             {online && selectedThread && !aiConfig && (
-              <div className="border-b border-border px-5 py-2.5 flex items-center justify-between gap-3 bg-violet-500/[0.03]">
+              <div className="border-b border-border px-5 py-2.5 flex items-center justify-between gap-3 bg-ai/[0.03]">
                 <p className="text-sm text-muted-foreground">
                   Connect AI to summarize threads and draft replies.
                 </p>
                 <Link
                   to="/settings"
-                  className="shrink-0 inline-flex items-center gap-1.5 text-xs font-medium text-violet-500 hover:text-violet-400"
+                  className="shrink-0 inline-flex items-center gap-1.5 text-xs font-medium text-ai hover:text-ai/80"
                 >
                   <Settings className="h-3.5 w-3.5" />
                   Setup

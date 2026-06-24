@@ -167,15 +167,6 @@ export async function streamDraftReply(
   return invoke("stream_draft_reply", { streamId, threadId, emailIds, tone });
 }
 
-export async function streamPolishCompose(
-  streamId: string,
-  subject: string,
-  draft: string,
-  tone: AiTone,
-): Promise<void> {
-  return invoke("stream_polish_compose", { streamId, subject, draft, tone });
-}
-
 export async function streamAiTransform(
   streamId: string,
   instruction: string,
