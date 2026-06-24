@@ -4,6 +4,8 @@ import { Mail, Settings, Moon, Sun } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import InboxPage from "@/pages/InboxPage";
 import SettingsPage from "@/pages/SettingsPage";
+import OnboardingFlow from "@/components/onboarding/OnboardingFlow";
+import { listAccounts } from "@/lib/api";
 
 function ThemeToggle() {
   const [dark, setDark] = useState(false);
@@ -65,6 +67,39 @@ function NavItem({
 function App() {
   const { pathname } = useLocation();
   const onInbox = pathname === "/";
+  const [onboarding, setOnboarding] = useState(false);
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    const onboarded = localStorage.getItem("p0mail:onboarded") === "true";
+    if (!onboarded) {
+      listAccounts()
+        .then((accounts) => {
+          if (accounts.length === 0) {
+            setOnboarding(true);
+          } else {
+            localStorage.setItem("p0mail:onboarded", "true");
+          }
+        })
+        .catch(() => setOnboarding(true))
+        .finally(() => setChecking(false));
+    } else {
+      setChecking(false);
+    }
+  }, []);
+
+  if (checking) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-background">
+        <div className="text-sm text-muted-foreground animate-pulse">Loading…</div>
+      </div>
+    );
+  }
+
+  if (onboarding) {
+    return <OnboardingFlow onComplete={() => setOnboarding(false)} />;
+  }
+
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">
       <aside className="w-12 shrink-0 border-r border-border bg-sidebar flex flex-col items-center">
