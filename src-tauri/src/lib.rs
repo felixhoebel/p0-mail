@@ -325,11 +325,14 @@ fn list_threads(
     let offset = offset.unwrap_or(0);
 
     let sql = match account_id {
-        Some(_) => "SELECT id, account_id, subject, latest_date, message_count, is_read, is_flagged \
-                     FROM threads WHERE account_id = ?1 \
-                     ORDER BY latest_date DESC LIMIT ?2 OFFSET ?3",
-        None => "SELECT id, account_id, subject, latest_date, message_count, is_read, is_flagged \
-                 FROM threads ORDER BY latest_date DESC LIMIT ?1 OFFSET ?2",
+        Some(_) => "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
+                     FROM threads t WHERE t.account_id = ?1 \
+                     AND EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id) \
+                     ORDER BY t.latest_date DESC LIMIT ?2 OFFSET ?3",
+        None => "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
+                 FROM threads t \
+                 WHERE EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id) \
+                 ORDER BY t.latest_date DESC LIMIT ?1 OFFSET ?2",
     };
 
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -615,11 +618,11 @@ async fn mark_read(email_id: i64, read: bool) -> Result<(), String> {
 
 #[tauri::command]
 async fn archive_email(email_id: i64) -> Result<(), String> {
-    let (account_id, provider_type, imap_host, imap_port, imap_encryption, email_address, uid, folder) = {
+    let (account_id, provider_type, imap_host, imap_port, imap_encryption, email_address, uid, folder, thread_id) = {
         let conn = db::get()?;
         conn.query_row(
             "SELECT e.account_id, a.provider_type, a.imap_host, a.imap_port, a.imap_encryption, \
-                    a.email_address, e.imap_uid, e.folder \
+                    a.email_address, e.imap_uid, e.folder, e.thread_id \
              FROM emails e JOIN accounts a ON e.account_id = a.id \
              WHERE e.id = ?1",
             rusqlite::params![email_id],
@@ -633,6 +636,7 @@ async fn archive_email(email_id: i64) -> Result<(), String> {
                     row.get::<_, String>(5)?,
                     row.get::<_, Option<i64>>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
                 ))
             },
         )
@@ -702,16 +706,20 @@ async fn archive_email(email_id: i64) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
+    if let Some(tid) = thread_id {
+        cleanup_empty_threads(tid)?;
+    }
+
     Ok(())
 }
 
 #[tauri::command]
 async fn delete_email(email_id: i64) -> Result<(), String> {
-    let (account_id, provider_type, imap_host, imap_port, imap_encryption, email_address, uid, folder) = {
+    let (account_id, provider_type, imap_host, imap_port, imap_encryption, email_address, uid, folder, thread_id) = {
         let conn = db::get()?;
         conn.query_row(
             "SELECT e.account_id, a.provider_type, a.imap_host, a.imap_port, a.imap_encryption, \
-                    a.email_address, e.imap_uid, e.folder \
+                    a.email_address, e.imap_uid, e.folder, e.thread_id \
              FROM emails e JOIN accounts a ON e.account_id = a.id \
              WHERE e.id = ?1",
             rusqlite::params![email_id],
@@ -725,6 +733,7 @@ async fn delete_email(email_id: i64) -> Result<(), String> {
                     row.get::<_, String>(5)?,
                     row.get::<_, Option<i64>>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
                 ))
             },
         )
@@ -766,6 +775,29 @@ async fn delete_email(email_id: i64) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
+    if let Some(tid) = thread_id {
+        cleanup_empty_threads(tid)?;
+    }
+
+    Ok(())
+}
+
+fn cleanup_empty_threads(thread_id: i64) -> Result<(), String> {
+    let conn = db::get()?;
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM emails WHERE thread_id = ?1",
+            rusqlite::params![thread_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if remaining == 0 {
+        conn.execute(
+            "DELETE FROM threads WHERE id = ?1",
+            rusqlite::params![thread_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
