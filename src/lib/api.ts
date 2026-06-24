@@ -181,6 +181,21 @@ export async function streamAiTransform(
   return invoke("stream_ai_transform", { streamId, instruction, subject, text, tone });
 }
 
+export interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+export async function streamChatAboutEmails(
+  streamId: string,
+  emailIds: number[],
+  question: string,
+  history: ChatMessage[],
+  tone: AiTone,
+): Promise<void> {
+  return invoke("stream_chat_about_emails", { streamId, emailIds, question, history, tone });
+}
+
 function normalizeAiStreamEvent(raw: Record<string, unknown>): AiStreamEvent {
   const kind = raw.tokenKind ?? raw.token_kind ?? "content";
   return {

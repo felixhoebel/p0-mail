@@ -984,6 +984,20 @@ async fn stream_ai_transform(
 }
 
 #[tauri::command]
+async fn stream_chat_about_emails(
+    app: tauri::AppHandle,
+    stream_id: String,
+    email_ids: Vec<i64>,
+    question: String,
+    history: Vec<ai::ChatMessage>,
+    tone: String,
+) -> Result<(), String> {
+    ai::AiService::new()
+        .stream_chat_about_emails(&app, &stream_id, &email_ids, &question, history, &tone)
+        .await
+}
+
+#[tauri::command]
 fn is_online() -> Result<bool, String> {
     Ok(reqwest::blocking::Client::new()
         .head("https://www.google.com")
@@ -1241,6 +1255,7 @@ pub fn run() {
             stream_summarize_thread,
             stream_draft_reply,
             stream_ai_transform,
+            stream_chat_about_emails,
             is_online,
             validate_imap_connection,
         ])

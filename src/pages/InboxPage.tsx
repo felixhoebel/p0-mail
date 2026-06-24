@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Link } from "react-router-dom";
-import { Loader2, Settings, Search, RefreshCw, Archive, Trash2, MailOpen, Mail, PenSquare, Reply, CornerDownLeft, Sparkles } from "lucide-react";
+import { Loader2, Settings, Search, RefreshCw, Archive, Trash2, MailOpen, Mail, PenSquare, Reply, CornerDownLeft, Sparkles, MessageSquare } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -31,6 +31,8 @@ import AiSummaryPanel from "@/components/ai/AiSummaryPanel";
 import AiActionButtons from "@/components/ai/AiActionButtons";
 import AiThinkingStrip from "@/components/ai/AiThinkingStrip";
 import AiInlineToolbar from "@/components/ai/AiInlineToolbar";
+import EmailChatPanel from "@/components/ai/EmailChatPanel";
+import { useContextMenu, ContextMenuView } from "@/components/ui/context-menu";
 import {
   getAiActionLabels,
   getAiPanelLabels,
@@ -399,8 +401,11 @@ export default function InboxPage() {
   const [inlineReplyReferences, setInlineReplyReferences] = useState<string[] | undefined>();
 
   const [aiDraftBody, setAiDraftBody] = useState<string | null>(null);
+  const [showChat, setShowChat] = useState(false);
+  const [chatEmailIds, setChatEmailIds] = useState<number[]>([]);
 
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const ctxMenu = useContextMenu();
 
   const aiTone = (aiConfig?.default_tone || "Professional") as AiTone;
   const aiLanguage = aiConfig?.output_language || "en";
@@ -587,15 +592,23 @@ export default function InboxPage() {
       if (list.length > 0) {
         const focusId = list[list.length - 1].id;
         setSelectedEmail(focusId);
-        if (!list[list.length - 1].is_read) {
-          markRead(focusId, true).catch(console.error);
+
+        const unread = list.filter((e) => !e.is_read);
+        if (unread.length > 0) {
+          await Promise.all(unread.map((e) => markRead(e.id, true).catch(console.error)));
+          const updated = list.map((e) => ({ ...e, is_read: true }));
+          setEmails(updated);
+          setThreads((prev) =>
+            prev.map((t) => (t.id === thread.id ? { ...t, is_read: true } : t)),
+          );
         }
+
         for (const email of list) {
           if (!email.body_html && !email.body_text) {
             fetchEmailBody(email.id)
               .then(async () => {
-                const updated = await getEmails(thread.id);
-                setEmails(updated);
+                const refreshed = await getEmails(thread.id);
+                setEmails(refreshed);
               })
               .catch((e) => setStatusMessage(String(e)));
           }
@@ -645,6 +658,24 @@ export default function InboxPage() {
 
   const selectedEmailData = emails.find((e) => e.id === selectedEmail);
   const lastEmail = emails[emails.length - 1];
+
+  const handleArchive = useCallback(async (emailId: number) => {
+    await archiveEmail(emailId).catch(console.error);
+    setThreads((prev) => prev.filter((t) => t.id !== selectedThread));
+    setSelectedThread(null);
+    setSelectedEmail(null);
+    setEmails([]);
+    loadThreads();
+  }, [selectedThread, loadThreads]);
+
+  const handleDelete = useCallback(async (emailId: number) => {
+    await deleteEmail(emailId).catch(console.error);
+    setThreads((prev) => prev.filter((t) => t.id !== selectedThread));
+    setSelectedThread(null);
+    setSelectedEmail(null);
+    setEmails([]);
+    loadThreads();
+  }, [selectedThread, loadThreads]);
 
   const openReplyComposer = useCallback((email: Email) => {
     const replyTo = email.from.map((a) => a.address).join(", ");
@@ -722,6 +753,117 @@ export default function InboxPage() {
     openReplyComposer(lastEmail);
   };
 
+  const handleChatAbout = useCallback(
+    (emailIds: number[]) => {
+      if (emailIds.length === 0) return;
+      setChatEmailIds(emailIds);
+      setShowChat(true);
+    },
+    [],
+  );
+
+  const handleThreadContextMenu = useCallback(
+    (e: React.MouseEvent, thread: Thread) => {
+      ctxMenu.show(e, [
+        {
+          label: "Open",
+          onClick: () => handleSelectThread(thread),
+        },
+        {
+          label: "Chat about thread",
+          icon: <MessageSquare className="h-3.5 w-3.5" />,
+          disabled: !aiConfig || !online,
+          onClick: async () => {
+            handleSelectThread(thread);
+            const fetched = await getEmails(thread.id).catch(() => []);
+            handleChatAbout(fetched.map((em) => em.id));
+          },
+        },
+        { separator: true },
+        {
+          label: "Mark read",
+          onClick: async () => {
+            const fetched = await getEmails(thread.id).catch(() => []);
+            await Promise.all(
+              fetched.filter((em) => !em.is_read).map((em) => markRead(em.id, true).catch(() => {})),
+            );
+            loadThreads();
+          },
+        },
+        {
+          label: "Mark unread",
+          onClick: async () => {
+            const fetched = await getEmails(thread.id).catch(() => []);
+            await Promise.all(
+              fetched.filter((em) => em.is_read).map((em) => markRead(em.id, false).catch(() => {})),
+            );
+            loadThreads();
+          },
+        },
+        { separator: true },
+        {
+          label: "Archive",
+          icon: <Archive className="h-3.5 w-3.5" />,
+          danger: true,
+          onClick: async () => {
+            const fetched = await getEmails(thread.id).catch(() => []);
+            for (const em of fetched) {
+              await archiveEmail(em.id).catch(() => {});
+            }
+            loadThreads();
+          },
+        },
+        {
+          label: "Delete",
+          icon: <Trash2 className="h-3.5 w-3.5" />,
+          danger: true,
+          onClick: async () => {
+            const fetched = await getEmails(thread.id).catch(() => []);
+            for (const em of fetched) {
+              await deleteEmail(em.id).catch(() => {});
+            }
+            loadThreads();
+          },
+        },
+      ]);
+    },
+    [ctxMenu, aiConfig, online, handleChatAbout, handleSelectThread, loadThreads],
+  );
+
+  const handleEmailContextMenu = useCallback(
+    (e: React.MouseEvent, email: Email) => {
+      ctxMenu.show(e, [
+        {
+          label: "Chat about this email",
+          icon: <MessageSquare className="h-3.5 w-3.5" />,
+          disabled: !aiConfig || !online,
+          onClick: () => handleChatAbout([email.id]),
+        },
+        { separator: true },
+        {
+          label: email.is_read ? "Mark unread" : "Mark read",
+          onClick: async () => {
+            await markRead(email.id, !email.is_read).catch(console.error);
+            setEmails((prev) => prev.map((em) => em.id === email.id ? { ...em, is_read: !email.is_read } : em));
+          },
+        },
+        {
+          label: "Archive",
+          icon: <Archive className="h-3.5 w-3.5" />,
+          danger: true,
+          onClick: () => handleArchive(email.id),
+        },
+        {
+          label: "Delete",
+          icon: <Trash2 className="h-3.5 w-3.5" />,
+          danger: true,
+          onClick: () => handleDelete(email.id),
+        },
+      ]);
+    },
+    [ctxMenu, aiConfig, online, handleChatAbout, handleArchive, handleDelete],
+  );
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
@@ -749,10 +891,10 @@ export default function InboxPage() {
         handleSummarize();
       } else if (e.key === "e" && selectedEmailData) {
         e.preventDefault();
-        archiveEmail(selectedEmailData.id).catch(console.error);
+        handleArchive(selectedEmailData.id);
       } else if ((e.key === "#" || e.key === "Delete") && selectedEmailData) {
         e.preventDefault();
-        deleteEmail(selectedEmailData.id).catch(console.error);
+        handleDelete(selectedEmailData.id);
       } else if (e.key === "/") {
         e.preventDefault();
         searchInputRef.current?.focus();
@@ -917,6 +1059,7 @@ export default function InboxPage() {
                     )}
                     <div
                       onClick={() => handleSelectThread(thread)}
+                      onContextMenu={(e) => handleThreadContextMenu(e, thread)}
                       className={`relative flex items-start gap-2.5 px-3 py-2.5 cursor-pointer transition-colors group ${
                         selected
                           ? "bg-accent"
@@ -980,21 +1123,30 @@ export default function InboxPage() {
             {/* Action toolbar */}
             <div className="flex items-center gap-1 px-3 py-1.5 border-b border-border shrink-0">
               <button
-                onClick={() => archiveEmail(selectedEmailData.id).catch(console.error)}
+                onClick={() => handleArchive(selectedEmailData.id)}
                 className="flex items-center justify-center rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
                 title="Archive"
               >
                 <Archive className="h-4 w-4" strokeWidth={1.75} />
               </button>
               <button
-                onClick={() => deleteEmail(selectedEmailData.id).catch(console.error)}
+                onClick={() => handleDelete(selectedEmailData.id)}
                 className="flex items-center justify-center rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
                 title="Delete"
               >
                 <Trash2 className="h-4 w-4" strokeWidth={1.75} />
               </button>
               <button
-                onClick={() => markRead(selectedEmailData.id, !selectedEmailData.is_read).catch(console.error)}
+                onClick={async () => {
+                  const newRead = !selectedEmailData.is_read;
+                  await markRead(selectedEmailData.id, newRead).catch(console.error);
+                  setEmails((prev) => prev.map((e) => e.id === selectedEmailData.id ? { ...e, is_read: newRead } : e));
+                  if (newRead) {
+                    setThreads((prev) => prev.map((t) => t.id === selectedThread ? { ...t, is_read: true } : t));
+                  } else {
+                    loadThreads();
+                  }
+                }}
                 className="flex items-center justify-center rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
                 title={selectedEmailData.is_read ? "Mark unread" : "Mark read"}
               >
@@ -1013,6 +1165,19 @@ export default function InboxPage() {
                   draftLoading={aiDraftLoading}
                   disabled={!lastEmail}
                 />
+              )}
+              {online && aiConfig && emails.length > 0 && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => handleChatAbout(emails.map((e) => e.id))}
+                  disabled={aiSummaryLoading || aiDraftLoading}
+                  className="h-8 text-xs gap-1.5"
+                  title="Chat about this thread"
+                >
+                  <MessageSquare className="h-3.5 w-3.5" strokeWidth={1.75} />
+                  Chat
+                </Button>
               )}
               {online && lastEmail && (
                 <Button
@@ -1066,6 +1231,7 @@ export default function InboxPage() {
                           : "cursor-pointer hover:bg-accent/30"
                       }`}
                       onClick={() => setSelectedEmail(email.id)}
+                      onContextMenu={(e) => handleEmailContextMenu(e, email)}
                     >
                       <EmailViewer email={email} />
                     </div>
@@ -1133,6 +1299,19 @@ export default function InboxPage() {
                   onRetry={handleSummarize}
                 />
               )}
+
+              {/* Chat panel */}
+              {showChat && (
+                <EmailChatPanel
+                  emailIds={chatEmailIds}
+                  emails={emails.filter((e) => chatEmailIds.includes(e.id))}
+                  tone={aiTone}
+                  onClose={() => {
+                    setShowChat(false);
+                    setChatEmailIds([]);
+                  }}
+                />
+              )}
             </div>
           </div>
         ) : (
@@ -1158,6 +1337,10 @@ export default function InboxPage() {
           </div>
         )}
       </div>
+
+      {ctxMenu.menu && (
+        <ContextMenuView menu={ctxMenu.menu} onClose={ctxMenu.hide} />
+      )}
     </div>
   );
 }

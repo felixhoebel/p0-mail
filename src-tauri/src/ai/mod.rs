@@ -16,9 +16,9 @@ struct ChatRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +192,76 @@ impl AiService {
             &settings.api_key,
             &settings.model,
             prompt,
+            4096,
+        )
+        .await
+    }
+
+    pub async fn stream_chat_about_emails(
+        &self,
+        app: &AppHandle,
+        stream_id: &str,
+        email_ids: &[i64],
+        question: &str,
+        history: Vec<ChatMessage>,
+        tone: &str,
+    ) -> Result<(), String> {
+        let question = question.trim();
+        if question.is_empty() {
+            let err = "Please enter a question.".to_string();
+            emit_stream_error(app, stream_id, &err);
+            return Err(err);
+        }
+
+        let settings = self.get_settings(tone).map_err(|e| {
+            emit_stream_error(app, stream_id, &e);
+            e
+        })?;
+
+        let emails = self.fetch_emails_by_ids(email_ids).map_err(|e| {
+            emit_stream_error(app, stream_id, &e);
+            e
+        })?;
+
+        validate_thread_has_content(&emails).map_err(|e| {
+            emit_stream_error(app, stream_id, &e);
+            e
+        })?;
+
+        let email_context = self.format_thread(&emails);
+        let language = output_language_name(&settings.output_language);
+
+        let mut system = format!(
+            "You are an email assistant. The user has selected one or more emails and wants to chat about them. \
+             Answer the user's questions based on the email content below. \
+             If the answer is not in the emails, say so clearly. \
+             Write your response entirely in {}. \
+             Tone: {}. \
+             Be concise and helpful. \
+             \n\n--- EMAILS ---\n{}",
+            language, settings.tone, email_context
+        );
+        append_custom_instructions(&mut system, &settings.custom_instructions);
+
+        let mut messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: system,
+            },
+        ];
+        messages.extend(history);
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: question.to_string(),
+        });
+
+        self.stream_chat(
+            app,
+            stream_id,
+            &settings.base_url,
+            &settings.api_key,
+            &settings.model,
+            messages,
             4096,
         )
         .await
