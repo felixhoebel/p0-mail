@@ -4,6 +4,7 @@ mod compose;
 mod db;
 mod email_parse;
 mod imap_client;
+mod imap_session;
 mod notifications;
 mod oauth;
 mod search;
@@ -164,7 +165,7 @@ fn list_accounts() -> Result<Vec<models::Account>, String> {
             })
         })
         .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
         .collect();
     Ok(accounts)
 }
@@ -191,7 +192,7 @@ fn list_folders(account_id: i64) -> Result<Vec<models::Folder>, String> {
             })
         })
         .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
         .collect();
     Ok(folders)
 }
@@ -427,11 +428,38 @@ async fn reauth_oauth_account(
 #[tauri::command]
 fn remove_account(account_id: i64) -> Result<(), String> {
     let conn = db::get()?;
-    conn.execute(
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM emails WHERE account_id = ?1",
+        rusqlite::params![account_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM threads WHERE account_id = ?1",
+        rusqlite::params![account_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM folders WHERE account_id = ?1",
+        rusqlite::params![account_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM folder_sync_state WHERE account_id = ?1",
+        rusqlite::params![account_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM send_queue WHERE account_id = ?1",
+        rusqlite::params![account_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
         "DELETE FROM accounts WHERE id = ?1",
         rusqlite::params![account_id],
     )
     .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     let _ = secure::delete_secret(&format!("account_{}_access_token", account_id));
     let _ = secure::delete_secret(&format!("account_{}_refresh_token", account_id));
     let _ = secure::delete_secret(&format!("account_{}_imap_password", account_id));
@@ -522,7 +550,7 @@ fn list_threads(
             })
         })
         .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
         .collect();
 
     Ok(threads)
@@ -542,44 +570,9 @@ fn get_emails(thread_id: i64) -> Result<Vec<models::Email>, String> {
         .map_err(|e| e.to_string())?;
 
     let emails: Vec<models::Email> = stmt
-        .query_map(rusqlite::params![thread_id], |row| {
-            let refs_str: Option<String> = row.get(6)?;
-            let refs: Option<Vec<String>> = refs_str
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok());
-            let from_str: String = row.get(8)?;
-            let to_str: String = row.get(9)?;
-            let cc_str: Option<String> = row.get(10)?;
-            let bcc_str: Option<String> = row.get(11)?;
-            let att_str: Option<String> = row.get(18)?;
-            let labels_str: String = row.get(19)?;
-            let labels: Vec<String> = serde_json::from_str(&labels_str).unwrap_or_default();
-
-            Ok(models::Email {
-                id: row.get(0)?,
-                thread_id: row.get(1)?,
-                account_id: row.get(2)?,
-                imap_uid: row.get(3)?,
-                message_id: row.get(4)?,
-                in_reply_to: row.get(5)?,
-                references_field: refs,
-                subject: decode_subject(row.get(7)?),
-                from_field: serde_json::from_str(&from_str).unwrap_or_default(),
-                to_field: serde_json::from_str(&to_str).unwrap_or_default(),
-                cc_field: cc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
-                bcc_field: bcc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
-                date_rfc2822: row.get(12)?,
-                received_at: row.get(13)?,
-                body_text: row.get(14)?,
-                body_html: row.get(15)?,
-                is_read: row.get::<_, i64>(16)? != 0,
-                folder: row.get(17)?,
-                labels,
-                attachments_meta: att_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
-            })
-        })
+        .query_map(rusqlite::params![thread_id], map_email_row)
         .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
         .collect();
 
     Ok(emails)
@@ -595,42 +588,7 @@ fn get_email(email_id: i64) -> Result<models::Email, String> {
          body_html, is_read, folder, attachments_meta, labels \
          FROM emails WHERE id = ?1",
         rusqlite::params![email_id],
-        |row| {
-            let refs_str: Option<String> = row.get(6)?;
-            let refs: Option<Vec<String>> = refs_str
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok());
-            let from_str: String = row.get(8)?;
-            let to_str: String = row.get(9)?;
-            let cc_str: Option<String> = row.get(10)?;
-            let bcc_str: Option<String> = row.get(11)?;
-            let att_str: Option<String> = row.get(18)?;
-            let labels_str: String = row.get(19)?;
-            let labels: Vec<String> = serde_json::from_str(&labels_str).unwrap_or_default();
-
-            Ok(models::Email {
-                id: row.get(0)?,
-                thread_id: row.get(1)?,
-                account_id: row.get(2)?,
-                imap_uid: row.get(3)?,
-                message_id: row.get(4)?,
-                in_reply_to: row.get(5)?,
-                references_field: refs,
-                subject: decode_subject(row.get(7)?),
-                from_field: serde_json::from_str(&from_str).unwrap_or_default(),
-                to_field: serde_json::from_str(&to_str).unwrap_or_default(),
-                cc_field: cc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
-                bcc_field: bcc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
-                date_rfc2822: row.get(12)?,
-                received_at: row.get(13)?,
-                body_text: row.get(14)?,
-                body_html: row.get(15)?,
-                is_read: row.get::<_, i64>(16)? != 0,
-                folder: row.get(17)?,
-                labels,
-                attachments_meta: att_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
-            })
-        },
+        map_email_row,
     )
     .map_err(|e| e.to_string())
 }
@@ -671,7 +629,7 @@ fn search_emails(query: String) -> Result<Vec<models::Thread>, String> {
             })
         })
         .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
         .collect();
     Ok(threads)
 }
@@ -681,14 +639,14 @@ fn reindex_account(account_id: i64) -> Result<(), String> {
     let conn = db::get()?;
     conn.execute(
         "INSERT INTO emails_fts(emails_fts, rowid, subject, from_address, to_address, body_text, body_html_stripped) \
-         SELECT 'delete', id, subject, from_json, to_json, COALESCE(body_text, ''), COALESCE(body_text, '') \
+         SELECT 'delete', id, subject, from_json, to_json, COALESCE(body_text, ''), strip_html(COALESCE(body_html, body_text, '')) \
          FROM emails WHERE account_id = ?1",
         rusqlite::params![account_id],
     )
     .map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO emails_fts(rowid, subject, from_address, to_address, body_text, body_html_stripped) \
-         SELECT id, subject, from_json, to_json, COALESCE(body_text, ''), COALESCE(body_text, '') \
+         SELECT id, subject, from_json, to_json, COALESCE(body_text, ''), strip_html(COALESCE(body_html, body_text, '')) \
          FROM emails WHERE account_id = ?1",
         rusqlite::params![account_id],
     )
@@ -698,29 +656,7 @@ fn reindex_account(account_id: i64) -> Result<(), String> {
 
 #[tauri::command]
 async fn mark_read(email_id: i64, read: bool) -> Result<(), String> {
-    let (account_id, provider_type, imap_host, imap_port, imap_encryption, email_address, uid, folder) = {
-        let conn = db::get()?;
-        conn.query_row(
-            "SELECT e.account_id, a.provider_type, a.imap_host, a.imap_port, a.imap_encryption, \
-                    a.email_address, e.imap_uid, e.folder \
-             FROM emails e JOIN accounts a ON e.account_id = a.id \
-             WHERE e.id = ?1",
-            rusqlite::params![email_id],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, String>(7)?,
-                ))
-            },
-        )
-        .map_err(|e| e.to_string())?
-    };
+    let ctx = imap_session::load_email_imap_context(email_id)?;
 
     {
         let conn = db::get()?;
@@ -732,35 +668,35 @@ async fn mark_read(email_id: i64, read: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
 
-    let host = match imap_host {
-        Some(h) => h,
+    let host = match ctx.imap_host {
+        Some(ref h) => h.as_str(),
         None => return Ok(()),
     };
-    let port = match imap_port {
+    let port = match ctx.imap_port {
         Some(p) => p,
         None => return Ok(()),
     };
-    let encryption = match imap_encryption {
-        Some(e) => e,
+    let encryption = match ctx.imap_encryption {
+        Some(ref e) => e.as_str(),
         None => return Ok(()),
     };
-    let imap_uid = match uid {
+    let imap_uid = match ctx.imap_uid {
         Some(u) => u,
         None => return Ok(()),
     };
 
-    let session_result = if provider_type == "gmail_oauth" || provider_type == "microsoft_oauth" {
-        let provider = match oauth::OAuthProvider::from_str(&provider_type) {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        imap_client::ImapConnection::connect_oauth(account_id, &provider, &email_address).await
-    } else {
-        imap_client::ImapConnection::connect_plain(account_id, &host, port, &encryption, &email_address).await
-    };
+    let session_result = imap_session::open_session(
+        ctx.account_id,
+        &ctx.provider_type,
+        host,
+        port,
+        encryption,
+        &ctx.email_address,
+    )
+    .await;
 
     if let Ok(mut session) = session_result {
-        if session.select(&folder).await.is_ok() {
+        if session.select(&ctx.folder).await.is_ok() {
             let flag_op = if read { "+FLAGS (\\Seen)" } else { "-FLAGS (\\Seen)" };
             let _stream = session.uid_store(format!("{}", imap_uid), flag_op).await;
         }
@@ -772,50 +708,29 @@ async fn mark_read(email_id: i64, read: bool) -> Result<(), String> {
 
 #[tauri::command]
 async fn archive_email(email_id: i64) -> Result<(), String> {
-    let (account_id, provider_type, imap_host, imap_port, imap_encryption, email_address, uid, folder, thread_id) = {
-        let conn = db::get()?;
-        conn.query_row(
-            "SELECT e.account_id, a.provider_type, a.imap_host, a.imap_port, a.imap_encryption, \
-                    a.email_address, e.imap_uid, e.folder, e.thread_id \
-             FROM emails e JOIN accounts a ON e.account_id = a.id \
-             WHERE e.id = ?1",
-            rusqlite::params![email_id],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
-                ))
-            },
-        )
-        .map_err(|e| e.to_string())?
-    };
+    let ctx = imap_session::load_email_imap_context(email_id)?;
 
-    let host = imap_host.ok_or("No IMAP host")?;
-    let port = imap_port.ok_or("No IMAP port")?;
-    let encryption = imap_encryption.ok_or("No IMAP encryption")?;
-    let imap_uid = uid.ok_or("No IMAP UID")?;
+    let host = ctx.imap_host.as_ref().ok_or("No IMAP host")?;
+    let port = ctx.imap_port.ok_or("No IMAP port")?;
+    let encryption = ctx.imap_encryption.as_ref().ok_or("No IMAP encryption")?;
+    let imap_uid = ctx.imap_uid.ok_or("No IMAP UID")?;
 
-    let mut session = if provider_type == "gmail_oauth" || provider_type == "microsoft_oauth" {
-        let provider = oauth::OAuthProvider::from_str(&provider_type)
-            .ok_or_else(|| format!("Invalid provider: {}", provider_type))?;
-        imap_client::ImapConnection::connect_oauth(account_id, &provider, &email_address).await?
-    } else {
-        imap_client::ImapConnection::connect_plain(account_id, &host, port, &encryption, &email_address).await?
-    };
+    let mut session = imap_session::open_session(
+        ctx.account_id,
+        &ctx.provider_type,
+        host,
+        port,
+        encryption,
+        &ctx.email_address,
+    )
+    .await?;
 
     session
-        .select(&folder)
+        .select(&ctx.folder)
         .await
         .map_err(|e| format!("SELECT failed: {:?}", e))?;
 
-    if provider_type == "gmail_oauth" {
+    if ctx.provider_type == "gmail_oauth" {
         let stream = session
             .uid_store(format!("{}", imap_uid), "+X-GM-LABELS ()")
             .await
@@ -835,7 +750,7 @@ async fn archive_email(email_id: i64) -> Result<(), String> {
                 .map_err(|e| format!("CREATE Archive failed: {:?}", e))?;
         }
         session
-            .select(&folder)
+            .select(&ctx.folder)
             .await
             .map_err(|e| format!("SELECT failed: {:?}", e))?;
         let _ = session
@@ -860,7 +775,7 @@ async fn archive_email(email_id: i64) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
-    if let Some(tid) = thread_id {
+    if let Some(tid) = ctx.thread_id {
         cleanup_empty_threads(tid)?;
     }
 
@@ -870,46 +785,25 @@ async fn archive_email(email_id: i64) -> Result<(), String> {
 
 #[tauri::command]
 async fn delete_email(email_id: i64) -> Result<(), String> {
-    let (account_id, provider_type, imap_host, imap_port, imap_encryption, email_address, uid, folder, thread_id) = {
-        let conn = db::get()?;
-        conn.query_row(
-            "SELECT e.account_id, a.provider_type, a.imap_host, a.imap_port, a.imap_encryption, \
-                    a.email_address, e.imap_uid, e.folder, e.thread_id \
-             FROM emails e JOIN accounts a ON e.account_id = a.id \
-             WHERE e.id = ?1",
-            rusqlite::params![email_id],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
-                ))
-            },
-        )
-        .map_err(|e| e.to_string())?
-    };
+    let ctx = imap_session::load_email_imap_context(email_id)?;
 
-    let host = imap_host.ok_or("No IMAP host")?;
-    let port = imap_port.ok_or("No IMAP port")?;
-    let encryption = imap_encryption.ok_or("No IMAP encryption")?;
-    let imap_uid = uid.ok_or("No IMAP UID")?;
+    let host = ctx.imap_host.as_ref().ok_or("No IMAP host")?;
+    let port = ctx.imap_port.ok_or("No IMAP port")?;
+    let encryption = ctx.imap_encryption.as_ref().ok_or("No IMAP encryption")?;
+    let imap_uid = ctx.imap_uid.ok_or("No IMAP UID")?;
 
-    let mut session = if provider_type == "gmail_oauth" || provider_type == "microsoft_oauth" {
-        let provider = oauth::OAuthProvider::from_str(&provider_type)
-            .ok_or_else(|| format!("Invalid provider: {}", provider_type))?;
-        imap_client::ImapConnection::connect_oauth(account_id, &provider, &email_address).await?
-    } else {
-        imap_client::ImapConnection::connect_plain(account_id, &host, port, &encryption, &email_address).await?
-    };
+    let mut session = imap_session::open_session(
+        ctx.account_id,
+        &ctx.provider_type,
+        host,
+        port,
+        encryption,
+        &ctx.email_address,
+    )
+    .await?;
 
     session
-        .select(&folder)
+        .select(&ctx.folder)
         .await
         .map_err(|e| format!("SELECT failed: {:?}", e))?;
 
@@ -930,7 +824,7 @@ async fn delete_email(email_id: i64) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
-    if let Some(tid) = thread_id {
+    if let Some(tid) = ctx.thread_id {
         cleanup_empty_threads(tid)?;
     }
 
@@ -1153,7 +1047,7 @@ fn get_send_queue() -> Result<Vec<models::SendQueueItem>, String> {
             })
         })
         .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
         .collect();
     Ok(items)
 }
@@ -1220,7 +1114,7 @@ fn list_drafts(account_id: Option<i64>) -> Result<Vec<models::SendQueueItem>, St
             .query_map([], map_send_queue_row)
             .map_err(|e| e.to_string())?,
     };
-    let items: Vec<models::SendQueueItem> = rows.filter_map(|r| r.ok()).collect();
+    let items: Vec<models::SendQueueItem> = rows.filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok()).collect();
     Ok(items)
 }
 
@@ -1257,96 +1151,137 @@ fn map_send_queue_row(row: &rusqlite::Row) -> rusqlite::Result<models::SendQueue
     })
 }
 
+fn map_email_row(row: &rusqlite::Row) -> rusqlite::Result<models::Email> {
+    let refs_str: Option<String> = row.get(6)?;
+    let refs: Option<Vec<String>> = refs_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let from_str: String = row.get(8)?;
+    let to_str: String = row.get(9)?;
+    let cc_str: Option<String> = row.get(10)?;
+    let bcc_str: Option<String> = row.get(11)?;
+    let att_str: Option<String> = row.get(18)?;
+    let labels_str: String = row.get(19)?;
+    let labels: Vec<String> = serde_json::from_str(&labels_str).unwrap_or_default();
+
+    Ok(models::Email {
+        id: row.get(0)?,
+        thread_id: row.get(1)?,
+        account_id: row.get(2)?,
+        imap_uid: row.get(3)?,
+        message_id: row.get(4)?,
+        in_reply_to: row.get(5)?,
+        references_field: refs,
+        subject: decode_subject(row.get(7)?),
+        from_field: serde_json::from_str(&from_str).unwrap_or_default(),
+        to_field: serde_json::from_str(&to_str).unwrap_or_default(),
+        cc_field: cc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+        bcc_field: bcc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+        date_rfc2822: row.get(12)?,
+        received_at: row.get(13)?,
+        body_text: row.get(14)?,
+        body_html: row.get(15)?,
+        is_read: row.get::<_, i64>(16)? != 0,
+        folder: row.get(17)?,
+        labels,
+        attachments_meta: att_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+    })
+}
+
 #[tauri::command]
 async fn retry_send_queue_item(queue_id: i64) -> Result<(), String> {
-    let _ = queue_id;
+    let item: (i64, i64, String, Option<String>, Option<String>, String, Option<String>, Option<String>, i64, Option<Vec<u8>>) = {
+        let conn = db::get()?;
+        conn.query_row(
+            "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
+             body_html, body_text, retry_count, attachments_data \
+             FROM send_queue WHERE id = ?1",
+            rusqlite::params![queue_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?
+    };
     let service = compose::ComposeService::new();
-    service.process_queue().await
+    service.process_queue_item(
+        item.0, item.1, item.2, item.3, item.4, item.5, item.6, item.7, item.8, item.9,
+    ).await
 }
 
 #[tauri::command]
 fn get_ai_config() -> Result<Option<models::AiConfig>, String> {
     let conn = db::get()?;
-    let base_url: Option<String> = conn
-        .query_row(
-            "SELECT value FROM app_settings WHERE key = 'ai_base_url'",
-            [],
-            |row| row.get(0),
+    let mut stmt = conn
+        .prepare(
+            "SELECT key, value FROM app_settings \
+             WHERE key IN ('ai_base_url','ai_model','ai_default_tone','ai_output_language','ai_custom_instructions')",
         )
-        .ok();
-    let model: Option<String> = conn
-        .query_row(
-            "SELECT value FROM app_settings WHERE key = 'ai_model'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    let default_tone: Option<String> = conn
-        .query_row(
-            "SELECT value FROM app_settings WHERE key = 'ai_default_tone'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    let output_language: Option<String> = conn
-        .query_row(
-            "SELECT value FROM app_settings WHERE key = 'ai_output_language'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    let custom_instructions: Option<String> = conn
-        .query_row(
-            "SELECT value FROM app_settings WHERE key = 'ai_custom_instructions'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.map_err(|e| log::warn!("ai_config row map: {e}")).ok())
+        .collect();
 
-    match base_url {
-        Some(bu) if !bu.is_empty() => {
-            let api_key = secure::get_ai_api_key().unwrap_or_default();
-            Ok(Some(models::AiConfig {
-                base_url: bu,
-                api_key,
-                model: model.unwrap_or_default(),
-                default_tone: default_tone.unwrap_or_else(|| "Professional".to_string()),
-                output_language: output_language.unwrap_or_else(|| "en".to_string()),
-                custom_instructions: custom_instructions.unwrap_or_default(),
-            }))
-        }
-        _ => Ok(None),
+    let get = |k: &str| -> String {
+        rows.iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    let base_url = get("ai_base_url");
+
+    if base_url.is_empty() {
+        return Ok(None);
     }
+    let api_key = secure::get_ai_api_key().unwrap_or_default();
+    Ok(Some(models::AiConfig {
+        base_url,
+        api_key,
+        model: get("ai_model"),
+        default_tone: {
+            let t = get("ai_default_tone");
+            if t.is_empty() { "Professional".to_string() } else { t }
+        },
+        output_language: {
+            let l = get("ai_output_language");
+            if l.is_empty() { "en".to_string() } else { l }
+        },
+        custom_instructions: get("ai_custom_instructions"),
+    }))
 }
 
 #[tauri::command]
 fn set_ai_config(config: models::AiConfig) -> Result<(), String> {
     let conn = db::get()?;
-    conn.execute(
-        "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('ai_base_url', ?1)",
-        rusqlite::params![config.base_url],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('ai_model', ?1)",
-        rusqlite::params![config.model],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('ai_default_tone', ?1)",
-        rusqlite::params![config.default_tone],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('ai_output_language', ?1)",
-        rusqlite::params![config.output_language],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('ai_custom_instructions', ?1)",
-        rusqlite::params![config.custom_instructions],
-    )
-    .map_err(|e| e.to_string())?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let pairs: [(&str, &str); 5] = [
+        ("ai_base_url", &config.base_url),
+        ("ai_model", &config.model),
+        ("ai_default_tone", &config.default_tone),
+        ("ai_output_language", &config.output_language),
+        ("ai_custom_instructions", &config.custom_instructions),
+    ];
+    for (key, value) in pairs {
+        tx.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
     secure::store_ai_api_key(&config.api_key)?;
     Ok(())
 }
@@ -1496,7 +1431,7 @@ async fn fetch_email_body(email_id: i64) -> Result<(), String> {
     };
 
     let host = match imap_host {
-        Some(h) => h,
+        Some(ref h) => h.as_str(),
         None => return Ok(()),
     };
     let port = match imap_port {
@@ -1504,7 +1439,7 @@ async fn fetch_email_body(email_id: i64) -> Result<(), String> {
         None => return Ok(()),
     };
     let encryption = match imap_encryption {
-        Some(e) => e,
+        Some(ref e) => e.as_str(),
         None => return Ok(()),
     };
     let uid = match imap_uid {
@@ -1512,13 +1447,15 @@ async fn fetch_email_body(email_id: i64) -> Result<(), String> {
         None => return Ok(()),
     };
 
-    let mut session = if provider_type == "gmail_oauth" || provider_type == "microsoft_oauth" {
-        let provider = oauth::OAuthProvider::from_str(&provider_type)
-            .ok_or_else(|| format!("Invalid provider: {}", provider_type))?;
-        imap_client::ImapConnection::connect_oauth(account_id, &provider, &email_address).await?
-    } else {
-        imap_client::ImapConnection::connect_plain(account_id, &host, port, &encryption, &email_address).await?
-    };
+    let mut session = imap_session::open_session(
+        account_id,
+        &provider_type,
+        host,
+        port,
+        encryption,
+        &email_address,
+    )
+    .await?;
 
     session
         .select(&folder)
@@ -1547,7 +1484,7 @@ async fn fetch_thread_bodies(thread_id: i64) -> Result<i64, String> {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
             .collect();
         rows
     };
@@ -1577,7 +1514,7 @@ async fn fetch_thread_bodies(thread_id: i64) -> Result<i64, String> {
     };
 
     let host = match imap_host {
-        Some(h) => h,
+        Some(ref h) => h.as_str(),
         None => return Ok(0),
     };
     let port = match imap_port {
@@ -1585,17 +1522,19 @@ async fn fetch_thread_bodies(thread_id: i64) -> Result<i64, String> {
         None => return Ok(0),
     };
     let encryption = match imap_encryption {
-        Some(e) => e,
+        Some(ref e) => e.as_str(),
         None => return Ok(0),
     };
 
-    let mut session = if provider_type == "gmail_oauth" || provider_type == "microsoft_oauth" {
-        let provider = oauth::OAuthProvider::from_str(&provider_type)
-            .ok_or_else(|| format!("Invalid provider: {}", provider_type))?;
-        imap_client::ImapConnection::connect_oauth(account_id, &provider, &email_address).await?
-    } else {
-        imap_client::ImapConnection::connect_plain(account_id, &host, port, &encryption, &email_address).await?
-    };
+    let mut session = imap_session::open_session(
+        account_id,
+        &provider_type,
+        host,
+        port,
+        encryption,
+        &email_address,
+    )
+    .await?;
 
     let mut fetched: i64 = 0;
     let mut current_folder = String::new();
@@ -1670,17 +1609,19 @@ async fn download_attachment(
         None => return Err("Email has no IMAP UID".to_string()),
     };
 
-    let host = imap_host.ok_or("No IMAP host")?;
+    let host = imap_host.as_ref().ok_or("No IMAP host")?;
     let port = imap_port.ok_or("No IMAP port")?;
-    let encryption = imap_encryption.ok_or("No IMAP encryption")?;
+    let encryption = imap_encryption.as_ref().ok_or("No IMAP encryption")?;
 
-    let mut session = if provider_type == "gmail_oauth" || provider_type == "microsoft_oauth" {
-        let provider = oauth::OAuthProvider::from_str(&provider_type)
-            .ok_or_else(|| format!("Invalid provider: {}", provider_type))?;
-        imap_client::ImapConnection::connect_oauth(account_id, &provider, &email_address).await?
-    } else {
-        imap_client::ImapConnection::connect_plain(account_id, &host, port, &encryption, &email_address).await?
-    };
+    let mut session = imap_session::open_session(
+        account_id,
+        &provider_type,
+        host,
+        port,
+        encryption,
+        &email_address,
+    )
+    .await?;
 
     session
         .select(&folder)
@@ -1762,9 +1703,9 @@ async fn fetch_recent_bodies(account_id: i64, limit: i64) -> Result<i64, String>
         .map_err(|e| e.to_string())?
     };
 
-    let host = imap_host.ok_or("No IMAP host")?;
+    let host = imap_host.as_ref().ok_or("No IMAP host")?;
     let port = imap_port.ok_or("No IMAP port")?;
-    let encryption = imap_encryption.ok_or("No IMAP encryption")?;
+    let encryption = imap_encryption.as_ref().ok_or("No IMAP encryption")?;
 
     let email_ids: Vec<(i64, i64, String)> = {
         let conn = db::get()?;
@@ -1780,7 +1721,7 @@ async fn fetch_recent_bodies(account_id: i64, limit: i64) -> Result<i64, String>
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
             .collect();
         rows
     };
@@ -1789,13 +1730,15 @@ async fn fetch_recent_bodies(account_id: i64, limit: i64) -> Result<i64, String>
         return Ok(0);
     }
 
-    let mut session = if provider_type == "gmail_oauth" || provider_type == "microsoft_oauth" {
-        let provider = oauth::OAuthProvider::from_str(&provider_type)
-            .ok_or_else(|| format!("Invalid provider: {}", provider_type))?;
-        imap_client::ImapConnection::connect_oauth(account_id, &provider, &email_address).await?
-    } else {
-        imap_client::ImapConnection::connect_plain(account_id, &host, port, &encryption, &email_address).await?
-    };
+    let mut session = imap_session::open_session(
+        account_id,
+        &provider_type,
+        host,
+        port,
+        encryption,
+        &email_address,
+    )
+    .await?;
 
     let mut fetched: i64 = 0;
     let mut current_folder = String::new();

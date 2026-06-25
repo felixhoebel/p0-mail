@@ -106,10 +106,18 @@ pub fn init() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     conn.pragma_update(None, "foreign_keys", true)?;
 
+    register_sql_functions(&conn)?;
     run_migrations(&conn)?;
 
     DB.set(Mutex::new(conn)).map_err(|_| "Database already initialized")?;
     Ok(())
+}
+
+fn register_sql_functions(conn: &Connection) -> SqlResult<()> {
+    conn.create_scalar_function("strip_html", 1, rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC | rusqlite::functions::FunctionFlags::SQLITE_UTF8, |ctx| {
+        let html = ctx.get::<Option<String>>(0)?.unwrap_or_default();
+        Ok(crate::email_parse::strip_html_tags(&html))
+    })
 }
 
 fn run_migrations(conn: &Connection) -> SqlResult<()> {
@@ -177,6 +185,11 @@ fn run_migrations(conn: &Connection) -> SqlResult<()> {
             "fts_conditional_triggers",
             include_str!("../../migrations/011_fts_conditional_triggers.sql"),
         ),
+        (
+            12,
+            "fts_html_stripped",
+            include_str!("../../migrations/012_fts_html_stripped.sql"),
+        ),
     ];
 
     for (id, name, sql) in migrations {
@@ -219,11 +232,12 @@ mod tests {
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
             .unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
+        register_sql_functions(&conn).unwrap();
         run_migrations(&conn).unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 11);
+        assert_eq!(count, 12);
     }
 
     #[test]
@@ -258,6 +272,48 @@ mod tests {
             .collect();
         assert!(tables.iter().any(|t| t == "folders"), "folders table missing");
         assert!(tables.iter().any(|t| t == "folder_sync_state"), "folder_sync_state table missing");
+    }
+
+    #[test]
+    fn fts_indexes_html_body_via_strip_html() {
+        let path = temp_path("p0mail_fts_html.db");
+        let conn = open_with_key(&path, &"00".repeat(32)).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        register_sql_functions(&conn).unwrap();
+        run_migrations(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO accounts (provider_type, display_name, email_address, last_seen_uid) \
+             VALUES ('imap', 't', 'a@b.com', 0)",
+            [],
+        )
+        .unwrap();
+        let account_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO threads (account_id, subject, latest_date, message_count, is_read) \
+             VALUES (?1, 's', 0, 1, 0)",
+            params![account_id],
+        )
+        .unwrap();
+        let thread_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO emails (thread_id, account_id, message_id, from_json, to_json, \
+             received_at, body_text, body_html, folder, is_read, labels) \
+             VALUES (?1, ?2, 'm1', '[]', '[]', 0, NULL, \
+             '<p>uniquewordhtml</p>', 'INBOX', 0, '[]')",
+            params![thread_id, account_id],
+        )
+        .unwrap();
+
+        let hit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM emails_fts WHERE emails_fts MATCH 'uniquewordhtml'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit, 1, "HTML body should be indexed after strip_html");
     }
 
     #[test]

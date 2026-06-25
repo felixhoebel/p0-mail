@@ -189,53 +189,71 @@ impl ComposeService {
         };
 
         for (id, account_id, to, cc, bcc, subject, body_html, body_text, retry_count, attachments_data) in items {
-            let attachments: Option<Vec<AttachmentPayload>> = attachments_data
-                .as_deref()
-                .and_then(|blob| serde_json::from_slice(blob).ok());
+            self.process_queue_item(id, account_id, to, cc, bcc, subject, body_html, body_text, retry_count, attachments_data).await?;
+        }
 
-            let result = self
-                .send_email(
-                    account_id,
-                    &to,
-                    cc.as_deref(),
-                    bcc.as_deref(),
-                    &subject,
-                    body_html.as_deref().unwrap_or(""),
-                    body_text.as_deref().unwrap_or(""),
-                    attachments,
-                    None,
-                    None,
+        Ok(())
+    }
+
+    pub async fn process_queue_item(
+        &self,
+        id: i64,
+        account_id: i64,
+        to: String,
+        cc: Option<String>,
+        bcc: Option<String>,
+        subject: String,
+        body_html: Option<String>,
+        body_text: Option<String>,
+        retry_count: i64,
+        attachments_data: Option<Vec<u8>>,
+    ) -> Result<(), String> {
+        let attachments: Option<Vec<AttachmentPayload>> = attachments_data
+            .as_deref()
+            .and_then(|blob| serde_json::from_slice(blob).ok());
+
+        let result = self
+            .send_email(
+                account_id,
+                &to,
+                cc.as_deref(),
+                bcc.as_deref(),
+                &subject,
+                body_html.as_deref().unwrap_or(""),
+                body_text.as_deref().unwrap_or(""),
+                attachments,
+                None,
+                None,
+            )
+            .await;
+
+        match result {
+            Ok(()) => {
+                let conn = db::get()?;
+                conn.execute(
+                    "UPDATE send_queue SET status = 'sent', sent_at = strftime('%s','now') WHERE id = ?1",
+                    rusqlite::params![id],
                 )
-                .await;
-
-            match result {
-                Ok(()) => {
-                    let conn = db::get()?;
+                .map_err(|e| e.to_string())?;
+            }
+            Err(e) => {
+                log::warn!("Send queue item {} failed: {}", id, e);
+                let new_retry = retry_count + 1;
+                let backoff_secs = std::cmp::min(2i64.pow(new_retry as u32), 300);
+                let next_retry = chrono::Utc::now().timestamp() + backoff_secs;
+                let conn = db::get()?;
+                if new_retry >= 5 {
                     conn.execute(
-                        "UPDATE send_queue SET status = 'sent', sent_at = strftime('%s','now') WHERE id = ?1",
-                        rusqlite::params![id],
+                        "UPDATE send_queue SET status = 'failed', retry_count = ?1 WHERE id = ?2",
+                        rusqlite::params![new_retry, id],
                     )
                     .map_err(|e| e.to_string())?;
-                }
-                Err(e) => {
-                    log::warn!("Send queue item {} failed: {}", id, e);
-                    let new_retry = retry_count + 1;
-                    let backoff_secs = std::cmp::min(2i64.pow(new_retry as u32), 300);
-                    let next_retry = chrono::Utc::now().timestamp() + backoff_secs;
-                    let conn = db::get()?;
-                    if new_retry >= 5 {
-                        conn.execute(
-                            "UPDATE send_queue SET status = 'failed', retry_count = ?1 WHERE id = ?2",
-                            rusqlite::params![new_retry, id],
-                        )
-                        .map_err(|e| e.to_string())?;
-                    } else {
-                        conn.execute(
-                            "UPDATE send_queue SET retry_count = ?1, next_retry_at = ?2 WHERE id = ?3",
-                            rusqlite::params![new_retry, next_retry, id],
-                        )
-                        .map_err(|e| e.to_string())?;
-                    }
+                } else {
+                    conn.execute(
+                        "UPDATE send_queue SET retry_count = ?1, next_retry_at = ?2 WHERE id = ?3",
+                        rusqlite::params![new_retry, next_retry, id],
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
             }
         }

@@ -2,7 +2,7 @@
 
 > **Purpose.** Self-contained workstream specs for autonomous agents. Each task lists what to build, which files to touch, dependencies, and how to verify. Pick a phase → pick a task → execute end-to-end.
 
-**Current state:** Phase 1 (P0) complete — DB encrypted at rest (SQLCipher), background polling with 60s jitter, new-mail desktop notifications, FTS5 search fixed (indexes body_text, returns threads), CI wired for macOS notarization + Windows EV signing. OAuth + IMAP + AI streaming working. Remaining: no attachments, no drafts, single-folder sync, no virtualization.
+**Current state:** Phase 1-3 complete (DB encrypted at rest, background polling, new-mail notifications, FTS5 search, CI signing, OAuth + IMAP + AI streaming, attachments, folders, drafts, reply-all/forward, virtualization, error boundary, sync health). Phase 4 (UX differentiators: command palette, undo send, snooze) + Phase 5 (code-quality refactors: lib.rs/InboxPage god-modules) remaining. An audit found a few latent bugs in "complete" tasks (see 5.2 FTS bug ✅fixed, mark_read swallows IMAP errors, handleArchive/handleDelete swallow backend errors) — these are tracked in Phase 5.
 
 **Conventions:** Conventional commits (`feat:`, `fix:`, `security:`, `chore:`). No comments unless asked. Rust in `src-tauri/src/`, React in `src/`. Verify with `cargo test` + `npm run build` (CI runs `tsc --noEmit` + build).
 
@@ -189,6 +189,62 @@
 
 ---
 
+## Phase 5 — P4: Code Quality & Maintainability
+
+Driven by an architecture audit of the two largest files (`lib.rs` 1957 LOC, `InboxPage.tsx` 1610 LOC). Each task is behavior-preserving unless flagged otherwise. Verify with `cargo clippy && cargo check` and `npm run build` after each.
+
+### 5.1 Extract IMAP session helper (lib.rs god-module)
+**Problem:** The "load email+account → unwrap Options → branch oauth/plain → connect → select" scaffolding is copy-pasted **7×** in `lib.rs` (mark_read:752-760, archive_email:805-811, delete_email:903-909, fetch_email_body:1515-1521, fetch_thread_bodies:1592-1598, download_attachment:1677-1683, fetch_recent_bodies:1792-1798). Each copy has subtly different error handling (`Ok(())` vs `Ok(0)` vs `.ok_or(...)`).
+**Spec:**
+- Add `struct ImapContext { account_id, provider_type, imap_host, imap_port, imap_encryption, email_address, imap_uid, folder, thread_id }`.
+- `fn load_email_imap_context(email_id) -> Result<ImapContext, String>` collapses the 4 identical email+account JOIN queries (mark_read, archive, delete, download_attachment). `fetch_email_body` keeps its own query (has a `body_html IS NULL` guard) but reuses the connect helper.
+- `async fn open_session(cfg) -> Result<ImapSession, String>` collapses the oauth-vs-plain connect branch (the 7 sites).
+- Keep each caller's existing Option→ error policy (no behavior change in this task); just route through the helpers.
+**Files:** `src-tauri/src/lib.rs` (or new `src-tauri/src/imap_session.rs`).
+**Verify:** `cargo clippy` clean; `cargo check`. No new warnings.
+**Depends on:** nothing. **Status:** ✅ COMPLETE
+
+### 5.2 Extract row mappers + fix reindex FTS bug
+**Problem:** The `Email` row mapper is duplicated verbatim in `get_emails` (544-583) and `get_email` (598-633). Separately, `reindex_account` (680-697) populates the FTS `body_html_stripped` column with `COALESCE(body_text, '')` on both delete and insert — **HTML bodies are never indexed** (bug, breaks FR-UI-05).
+**Spec:**
+- Extract `fn map_email_row(row: &rusqlite::Row) -> rusqlite::Result<models::Email>` (mirrors `map_send_queue_row` at 1238-1258). Collapse `get_emails`/`get_email`.
+- Fix `reindex_account`: strip `<tags>` from `body_html` (reuse a small regex or the existing html-to-text approach) before populating `body_html_stripped`. Fallback to `body_text` when `body_html` is NULL.
+**Files:** `src-tauri/src/lib.rs`.
+**Verify:** After reindex, search for a word that only appears in an HTML body → result appears.
+**Status:** FTS bug ✅ FIXED; row mapper pending.
+
+### 5.3 Quick wins bundle (lib.rs)
+- `retry_send_queue_item(queue_id)` (1261-1265): `queue_id` param is dead (`let _ = queue_id`). Honor it (process just that item) or drop from signature + `invoke_handler!`.
+- `get_ai_config`/`set_ai_config` (1267-1352): 5 sequential `query_row` + 5 sequential `execute`. Collapse to one `SELECT key, value FROM app_settings WHERE key IN (...)` and one transactional upsert.
+- `.filter_map(|r| r.ok())` appears 10× in lib.rs (167, 194, 525, 582, 674, 1156, 1223, 1550, 1783) — swallows row-map errors silently. Switch to `.filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())`.
+- `remove_account` (428-439): deletes `accounts` row + keychain only; orphans `emails`/`threads`/`folders`/`folder_sync_state`/`send_queue`. Add `DELETE FROM ... WHERE account_id = ?` for each (FK cascade is declared but rusqlite needs `PRAGMA foreign_keys=ON`; explicit deletes are safer).
+**Files:** `src-tauri/src/lib.rs`.
+**Status:** ✅ COMPLETE (filter_map logging, ai_config batching, retry_queue param, remove_account cleanup)
+
+### 5.4 Split InboxPage god-component
+**Problem:** `InboxPage.tsx` (1610 LOC, 30+ `useState`) mixes UI + IPC + state orchestration + business logic + keyboard shortcuts. Race: `handleSelectThread` (635-671) has no request cancellation → fast clicks show thread A's emails under thread B. `handleArchive`/`handleDelete` (714-756) swallow backend errors yet remove the email from local state (reappears on next sync).
+**Spec:**
+- Extract `useThreads`, `useEmailSelection`, `useAiStream`, `useKeyboardShortcuts` hooks + `<InboxSidebar>`, `<ReadingPane>`, `<AiRail>` components. Target: `InboxPage` body ~200 LOC.
+- Add a request token to `handleSelectThread` so stale `getEmails`/`fetchThreadBodies` results are discarded.
+- Make `handleArchive`/`handleDelete` surface errors via `statusMessage` and only mutate local state on success.
+**Files:** `src/pages/InboxPage.tsx`, new `src/hooks/`, new `src/components/inbox/`.
+**Status:** pending (large; defer until 5.1-5.3 land).
+
+### 5.5 Unify InlineReplyEditor + ComposeEditor
+**Problem:** `InlineReplyEditor` (InboxPage:132-331) and `ComposeEditor.tsx` (329 LOC) duplicate the tiptap setup, To/Cc/Subject inputs, `AiInlineToolbar` integration. `ComposeEditor.tsx:100` sends attachments as `number[]` over IPC (10MB → 10M-element array).
+**Spec:** Extract `<Composer mode="inline"|"compose">`. Fix attachment IPC to use a typed array or base64.
+**Files:** `src/components/email/Composer.tsx` (new), `ComposeEditor.tsx`, `InboxPage.tsx`.
+**Status:** pending.
+
+### 5.6 Duplicate `formatDate` + misc frontend dedup
+- `formatDate` duplicated in `InboxPage.tsx:51` and `EmailViewer.tsx:70` with *different* formats → extract to `src/lib/format.ts`.
+- `Re:`/`Fwd:` subject-prefix logic duplicated 3× (InboxPage:761, 802, 1016 + forward) → extract to `src/lib/quote.ts` (already has `buildReplyQuoteBody`).
+- `handleArchive`/`handleDelete` busy-set dance repeated 8× → `useBusySet()` hook.
+**Files:** `src/lib/format.ts` (new), `src/lib/quote.ts`, `InboxPage.tsx`, `EmailViewer.tsx`.
+**Status:** pending.
+
+---
+
 ## Phase 4 — P3: 2026 UX Differentiators
 
 ### 4.1 Command palette (⌘K)
@@ -285,3 +341,11 @@ When picking up a task:
 - [ ] 4.6 Smart bundles
 - [ ] 4.7 Per-account settings
 - [ ] 4.8 Live theme sync
+
+## Phase 5 — Code Quality
+- [x] 5.1 IMAP session helper (lib.rs)
+- [x] 5.2 Row mappers + FTS bug fix (migration 012: strip_html SQL fn; regression test added)
+- [x] 5.3 Quick wins (filter_map logging, ai_config batching, retry_queue param, remove_account cleanup)
+- [ ] 5.4 Split InboxPage god-component
+- [ ] 5.5 Unify InlineReplyEditor + ComposeEditor
+- [ ] 5.6 formatDate dedup + frontend quick wins
