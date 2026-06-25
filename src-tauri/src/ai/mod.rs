@@ -480,7 +480,11 @@ impl AiService {
                 None => continue,
             };
 
-            if session.select(folder).await.is_ok() {
+            if tokio::time::timeout(std::time::Duration::from_secs(10), session.select(folder))
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false)
+            {
                 if let Ok(raw) =
                     crate::imap_client::fetch_uid_message_raw(&mut session, uid as u32).await
                 {
@@ -489,7 +493,7 @@ impl AiService {
             }
         }
 
-        let _ = session.logout().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), session.logout()).await;
         Ok(())
     }
 
@@ -761,7 +765,24 @@ impl AiService {
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
 
-        while let Some(chunk_result) = stream.next().await {
+        loop {
+            let chunk_result = match tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                stream.next(),
+            )
+            .await
+            {
+                Ok(opt) => match opt {
+                    Some(r) => r,
+                    None => break,
+                },
+                Err(_) => {
+                    let err = "AI stream chunk timed out after 60s".to_string();
+                    emit_stream_error(app, stream_id, &err);
+                    return Err(err);
+                }
+            };
+
             let chunk = match chunk_result {
                 Ok(c) => c,
                 Err(e) => {

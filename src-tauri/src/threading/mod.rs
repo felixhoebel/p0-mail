@@ -1,6 +1,6 @@
 use crate::db;
 use crate::email_parse;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 struct RawEmail {
     id: i64,
@@ -72,30 +72,25 @@ impl ThreadingService {
         }
 
         let mut parent: Vec<Option<usize>> = vec![None; emails.len()];
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); emails.len()];
 
         for (idx, email) in emails.iter().enumerate() {
             let parent_idx = self.find_parent(email, &msg_id_to_idx);
             if let Some(pi) = parent_idx {
                 if pi != idx && !self.would_cycle(idx, pi, &parent) {
                     parent[idx] = Some(pi);
+                    children[pi].push(idx);
                 }
             }
         }
 
-        let mut roots: HashSet<usize> = HashSet::new();
-        for i in 0..emails.len() {
-            roots.insert(i);
-        }
-        for i in 0..emails.len() {
-            if parent[i].is_some() {
-                roots.remove(&i);
-            }
-        }
-
         let mut threads: Vec<Vec<i64>> = Vec::new();
-        for &root in &roots {
+        for root in 0..emails.len() {
+            if parent[root].is_some() {
+                continue;
+            }
             let mut thread: Vec<i64> = Vec::new();
-            self.collect_thread(root, &parent, emails, &mut thread);
+            self.collect_thread_iter(root, &children, &mut thread);
             thread.sort_by_key(|&i| emails[i as usize].received_at);
             threads.push(thread);
         }
@@ -138,17 +133,17 @@ impl ThreadingService {
         }
     }
 
-    fn collect_thread(
+    fn collect_thread_iter(
         &self,
         node: usize,
-        parent: &[Option<usize>],
-        emails: &[RawEmail],
+        children: &[Vec<usize>],
         thread: &mut Vec<i64>,
     ) {
-        thread.push(node as i64);
-        for i in 0..emails.len() {
-            if parent[i] == Some(node) {
-                self.collect_thread(i, parent, emails, thread);
+        let mut stack = vec![node];
+        while let Some(n) = stack.pop() {
+            thread.push(n as i64);
+            for &child in &children[n] {
+                stack.push(child);
             }
         }
     }
@@ -159,68 +154,67 @@ impl ThreadingService {
         threads: &[Vec<i64>],
         emails: &[RawEmail],
     ) -> Result<(), String> {
-        let conn = db::get()?;
+        let mut conn = db::get()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
 
-        conn.execute(
-            "UPDATE emails SET thread_id = NULL WHERE account_id = ?1",
-            rusqlite::params![account_id],
-        )
-        .map_err(|e| e.to_string())?;
-
-        conn.execute(
+        tx.execute(
             "DELETE FROM threads WHERE account_id = ?1",
             rusqlite::params![account_id],
         )
         .map_err(|e| e.to_string())?;
 
-        for thread_indices in threads {
-            if thread_indices.is_empty() {
-                continue;
-            }
-
-            let subject = emails[thread_indices[0] as usize]
-                .subject
-                .as_ref()
-                .map(|s| email_parse::decode_header(s))
-                .unwrap_or_default();
-
-            let latest_date = thread_indices
-                .iter()
-                .map(|&i| emails[i as usize].received_at)
-                .max()
-                .unwrap_or(0);
-
-            let message_count = thread_indices.len() as i64;
-
-            let is_read = thread_indices.iter().all(|&i| emails[i as usize].is_read);
-
-            let is_flagged = thread_indices.iter().any(|&i| emails[i as usize].is_flagged);
-
-            conn.execute(
+        {
+            let mut insert_thread = tx.prepare(
                 "INSERT INTO threads (account_id, subject, latest_date, message_count, is_read, is_flagged) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
+            ).map_err(|e| e.to_string())?;
+            let mut update_email = tx.prepare(
+                "UPDATE emails SET thread_id = ?1 WHERE id = ?2",
+            ).map_err(|e| e.to_string())?;
+
+            for thread_indices in threads {
+                if thread_indices.is_empty() {
+                    continue;
+                }
+
+                let subject = emails[thread_indices[0] as usize]
+                    .subject
+                    .as_ref()
+                    .map(|s| email_parse::decode_header(s))
+                    .unwrap_or_default();
+
+                let latest_date = thread_indices
+                    .iter()
+                    .map(|&i| emails[i as usize].received_at)
+                    .max()
+                    .unwrap_or(0);
+
+                let message_count = thread_indices.len() as i64;
+
+                let is_read = thread_indices.iter().all(|&i| emails[i as usize].is_read);
+
+                let is_flagged = thread_indices.iter().any(|&i| emails[i as usize].is_flagged);
+
+                insert_thread.execute(rusqlite::params![
                     account_id,
                     subject,
                     latest_date,
                     message_count,
                     is_read as i64,
                     is_flagged as i64,
-                ],
-            )
-            .map_err(|e| e.to_string())?;
+                ]).map_err(|e| e.to_string())?;
 
-            let thread_id = conn.last_insert_rowid();
+                let thread_id = tx.last_insert_rowid();
 
-            for &idx in thread_indices {
-                let email_id = emails[idx as usize].id;
-                conn.execute(
-                    "UPDATE emails SET thread_id = ?1 WHERE id = ?2",
-                    rusqlite::params![thread_id, email_id],
-                )
-                .map_err(|e| e.to_string())?;
+                for &idx in thread_indices {
+                    let email_id = emails[idx as usize].id;
+                    update_email.execute(rusqlite::params![thread_id, email_id])
+                        .map_err(|e| e.to_string())?;
+                }
             }
         }
+
+        tx.commit().map_err(|e| e.to_string())?;
 
         Ok(())
     }

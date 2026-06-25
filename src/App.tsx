@@ -4,6 +4,7 @@ import { Mail, Settings, Moon, Sun, Loader2 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import InboxPage from "@/pages/InboxPage";
 import { listAccounts } from "@/lib/api";
+import { ErrorBoundary } from "@/components/ui/error-boundary";
 
 const SettingsPage = lazy(() => import("@/pages/SettingsPage"));
 const OnboardingFlow = lazy(() => import("@/components/onboarding/OnboardingFlow"));
@@ -121,13 +122,17 @@ function App() {
       </aside>
       <main className="flex-1 overflow-hidden">
         <div className={onInbox ? "h-full" : "hidden"}>
-          <InboxPage />
+          <ErrorBoundary fallbackLabel="Couldn't display this email.">
+            <InboxPage />
+          </ErrorBoundary>
         </div>
         {!onInbox && (
           <div className="h-full">
-            <Suspense fallback={<div className="flex h-full items-center justify-center"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>}>
-              <SettingsPage />
-            </Suspense>
+            <ErrorBoundary fallbackLabel="Couldn't display settings.">
+              <Suspense fallback={<div className="flex h-full items-center justify-center"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>}>
+                <SettingsPage />
+              </Suspense>
+            </ErrorBoundary>
           </div>
         )}
       </main>

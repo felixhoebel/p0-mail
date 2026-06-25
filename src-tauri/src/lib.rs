@@ -21,6 +21,7 @@ use tauri::{Emitter, Manager, WindowEvent};
 const POLL_INTERVAL_SECS: u64 = 60;
 const POLL_JITTER_SECS: i64 = 10;
 const POLL_BACKOFF_SECS: u64 = 300;
+const SYNC_TIMEOUT_SECS: u64 = 120;
 
 fn jittered_interval(base: u64) -> u64 {
     let nanos = std::time::SystemTime::now()
@@ -44,8 +45,13 @@ async fn run_poll_loop(app: tauri::AppHandle, wake: Arc<tokio::sync::Notify>) {
             _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {}
             _ = wake.notified() => {}
         }
-        match engine.sync_all().await {
-            Ok(results) => {
+        match tokio::time::timeout(
+            Duration::from_secs(SYNC_TIMEOUT_SECS),
+            engine.sync_all(),
+        )
+        .await
+        {
+            Ok(Ok(results)) => {
                 backoff = false;
                 let account_ids: Vec<i64> = results.iter().map(|r| r.account_id).collect();
                 for r in &results {
@@ -58,8 +64,12 @@ async fn run_poll_loop(app: tauri::AppHandle, wake: Arc<tokio::sync::Notify>) {
                 }
                 notifications::notify_new_mail(&app, &account_ids);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 log::error!("Background sync cycle failed: {}", e);
+                backoff = true;
+            }
+            Err(_) => {
+                log::error!("Background sync timed out after {}s", SYNC_TIMEOUT_SECS);
                 backoff = true;
             }
         }
@@ -85,6 +95,40 @@ struct ImapAccountParams {
     password: String,
 }
 
+fn validate_imap_params(params: &ImapAccountParams) -> Result<(), String> {
+    if params.display_name.trim().is_empty() {
+        return Err("Display name is required".to_string());
+    }
+    if params.email_address.trim().is_empty() || !params.email_address.contains('@') {
+        return Err("A valid email address is required".to_string());
+    }
+    if params.imap_host.trim().is_empty() {
+        return Err("IMAP host is required".to_string());
+    }
+    if params.imap_port < 1 || params.imap_port > 65535 {
+        return Err("IMAP port must be between 1 and 65535".to_string());
+    }
+    if !matches!(params.imap_encryption.as_str(), "SSL" | "STARTTLS") {
+        return Err("IMAP encryption must be SSL or STARTTLS".to_string());
+    }
+    if params.smtp_host.trim().is_empty() {
+        return Err("SMTP host is required".to_string());
+    }
+    if params.smtp_port < 1 || params.smtp_port > 65535 {
+        return Err("SMTP port must be between 1 and 65535".to_string());
+    }
+    if !matches!(params.smtp_encryption.as_str(), "SSL" | "STARTTLS") {
+        return Err("SMTP encryption must be SSL or STARTTLS".to_string());
+    }
+    if params.username.trim().is_empty() {
+        return Err("Username is required".to_string());
+    }
+    if params.password.is_empty() {
+        return Err("Password is required".to_string());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn list_accounts() -> Result<Vec<models::Account>, String> {
     let conn = db::get()?;
@@ -93,7 +137,7 @@ fn list_accounts() -> Result<Vec<models::Account>, String> {
             "SELECT id, provider_type, display_name, email_address, \
              imap_host, imap_port, imap_encryption, \
              smtp_host, smtp_port, smtp_encryption, \
-             last_seen_uid, created_at FROM accounts",
+             last_seen_uid, created_at, sync_error, sync_error_at FROM accounts",
         )
         .map_err(|e| e.to_string())?;
     let accounts = stmt
@@ -115,12 +159,41 @@ fn list_accounts() -> Result<Vec<models::Account>, String> {
                 last_seen_uid: row.get(10)?,
                 created_at: row.get(11)?,
                 needs_reauth: oauth && !secure::has_access_token(id),
+                sync_error: row.get(12)?,
+                sync_error_at: row.get(13)?,
             })
         })
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
     Ok(accounts)
+}
+
+#[tauri::command]
+fn list_folders(account_id: i64) -> Result<Vec<models::Folder>, String> {
+    let conn = db::get()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, account_id, name, imap_name, special_use \
+             FROM folders WHERE account_id = ?1 ORDER BY \
+             CASE special_use WHEN 'inbox' THEN 0 WHEN 'sent' THEN 1 WHEN 'drafts' THEN 2 \
+             WHEN 'spam' THEN 3 WHEN 'trash' THEN 4 WHEN 'archive' THEN 5 ELSE 6 END, name",
+        )
+        .map_err(|e| e.to_string())?;
+    let folders = stmt
+        .query_map(rusqlite::params![account_id], |row| {
+            Ok(models::Folder {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                name: row.get(2)?,
+                imap_name: row.get(3)?,
+                special_use: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(folders)
 }
 
 #[tauri::command]
@@ -209,11 +282,15 @@ async fn add_oauth_account(
         last_seen_uid: 0,
         created_at: chrono::Utc::now().timestamp(),
         needs_reauth: false,
+        sync_error: None,
+        sync_error_at: None,
     })
 }
 
 #[tauri::command]
 fn add_imap_account(params: ImapAccountParams) -> Result<models::Account, String> {
+    validate_imap_params(&params)?;
+
     let conn = db::get()?;
     conn.execute(
         "INSERT INTO accounts \
@@ -251,6 +328,8 @@ fn add_imap_account(params: ImapAccountParams) -> Result<models::Account, String
         last_seen_uid: 0,
         created_at: chrono::Utc::now().timestamp(),
         needs_reauth: false,
+        sync_error: None,
+        sync_error_at: None,
     })
 }
 
@@ -340,6 +419,8 @@ async fn reauth_oauth_account(
         last_seen_uid: row,
         created_at: chrono::Utc::now().timestamp(),
         needs_reauth: false,
+        sync_error: None,
+        sync_error_at: None,
     })
 }
 
@@ -363,6 +444,7 @@ async fn trigger_sync(account_id: Option<i64>) -> Result<(), String> {
     match account_id {
         Some(id) => {
             engine.sync_account(id).await?;
+            sync::SyncEngine::clear_sync_error(id).ok();
             Ok(())
         }
         None => {
@@ -386,6 +468,7 @@ fn set_account_sync_enabled(account_id: i64, enabled: bool) -> Result<(), String
 #[tauri::command]
 fn list_threads(
     account_id: Option<i64>,
+    folder: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<Vec<models::Thread>, String> {
@@ -393,51 +476,54 @@ fn list_threads(
     let limit = limit.unwrap_or(100);
     let offset = offset.unwrap_or(0);
 
-    let sql = match account_id {
-        Some(_) => "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
-                     FROM threads t WHERE t.account_id = ?1 \
-                     AND EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id) \
-                     ORDER BY t.latest_date DESC LIMIT ?2 OFFSET ?3",
-        None => "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
-                 FROM threads t \
-                 WHERE EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id) \
-                 ORDER BY t.latest_date DESC LIMIT ?1 OFFSET ?2",
+    let (sql, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match (account_id, folder) {
+        (Some(aid), Some(f)) => (
+            "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
+             FROM threads t WHERE t.account_id = ?1 \
+             AND EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id AND e.folder = ?2) \
+             ORDER BY t.latest_date DESC LIMIT ?3 OFFSET ?4".to_string(),
+            vec![Box::new(aid), Box::new(f), Box::new(limit), Box::new(offset)],
+        ),
+        (Some(aid), None) => (
+            "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
+             FROM threads t WHERE t.account_id = ?1 \
+             AND EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id) \
+             ORDER BY t.latest_date DESC LIMIT ?2 OFFSET ?3".to_string(),
+            vec![Box::new(aid), Box::new(limit), Box::new(offset)],
+        ),
+        (None, Some(f)) => (
+            "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
+             FROM threads t \
+             WHERE EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id AND e.folder = ?1) \
+             ORDER BY t.latest_date DESC LIMIT ?2 OFFSET ?3".to_string(),
+            vec![Box::new(f), Box::new(limit), Box::new(offset)],
+        ),
+        (None, None) => (
+            "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
+             FROM threads t \
+             WHERE EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id) \
+             ORDER BY t.latest_date DESC LIMIT ?1 OFFSET ?2".to_string(),
+            vec![Box::new(limit), Box::new(offset)],
+        ),
     };
 
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-
-    let threads: Vec<models::Thread> = match account_id {
-        Some(aid) => stmt
-            .query_map(rusqlite::params![aid, limit, offset], |row| {
-                Ok(models::Thread {
-                    id: row.get(0)?,
-                    account_id: row.get(1)?,
-                    subject: decode_subject(row.get(2)?),
-                    latest_date: row.get(3)?,
-                    message_count: row.get(4)?,
-                    is_read: row.get::<_, i64>(5)? != 0,
-                    is_flagged: row.get::<_, i64>(6)? != 0,
-                })
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let threads: Vec<models::Thread> = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            Ok(models::Thread {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                subject: decode_subject(row.get(2)?),
+                latest_date: row.get(3)?,
+                message_count: row.get(4)?,
+                is_read: row.get::<_, i64>(5)? != 0,
+                is_flagged: row.get::<_, i64>(6)? != 0,
             })
-            .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect(),
-        None => stmt
-            .query_map(rusqlite::params![limit, offset], |row| {
-                Ok(models::Thread {
-                    id: row.get(0)?,
-                    account_id: row.get(1)?,
-                    subject: decode_subject(row.get(2)?),
-                    latest_date: row.get(3)?,
-                    message_count: row.get(4)?,
-                    is_read: row.get::<_, i64>(5)? != 0,
-                    is_flagged: row.get::<_, i64>(6)? != 0,
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect(),
-    };
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
 
     Ok(threads)
 }
@@ -678,6 +764,7 @@ async fn mark_read(email_id: i64, read: bool) -> Result<(), String> {
             let flag_op = if read { "+FLAGS (\\Seen)" } else { "-FLAGS (\\Seen)" };
             let _stream = session.uid_store(format!("{}", imap_uid), flag_op).await;
         }
+        imap_client::logout_session(&mut session).await;
     }
 
     Ok(())
@@ -777,6 +864,7 @@ async fn archive_email(email_id: i64) -> Result<(), String> {
         cleanup_empty_threads(tid)?;
     }
 
+    imap_client::logout_session(&mut session).await;
     Ok(())
 }
 
@@ -846,6 +934,7 @@ async fn delete_email(email_id: i64) -> Result<(), String> {
         cleanup_empty_threads(tid)?;
     }
 
+    imap_client::logout_session(&mut session).await;
     Ok(())
 }
 
@@ -877,10 +966,11 @@ async fn send_email(
     subject: String,
     body_html: String,
     body_text: String,
-    attachments: Option<Vec<String>>,
+    attachments: Option<Vec<models::AttachmentPayload>>,
     in_reply_to: Option<String>,
     references: Option<Vec<String>>,
 ) -> Result<(), String> {
+    let refs_for_sent = references.clone();
     let service = compose::ComposeService::new();
     service
         .send_email(
@@ -895,7 +985,139 @@ async fn send_email(
             in_reply_to.as_deref(),
             references,
         )
-        .await
+        .await?;
+
+    insert_sent_copy(
+        account_id,
+        &to,
+        cc.as_deref(),
+        bcc.as_deref(),
+        &subject,
+        &body_html,
+        &body_text,
+        in_reply_to.as_deref(),
+        refs_for_sent.as_deref(),
+    )
+    .ok();
+
+    let _ = tokio::task::spawn_blocking(move || {
+        let threading = threading::ThreadingService::new();
+        threading.rebuild_threads_for_account(account_id)
+    }).await;
+
+    Ok(())
+}
+
+fn insert_sent_copy(
+    account_id: i64,
+    to: &str,
+    cc: Option<&str>,
+    bcc: Option<&str>,
+    subject: &str,
+    body_html: &str,
+    body_text: &str,
+    in_reply_to: Option<&str>,
+    references: Option<&[String]>,
+) -> Result<(), String> {
+    let email_address: String = {
+        let conn = db::get()?;
+        conn.query_row(
+            "SELECT email_address FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    let from_json = serde_json::to_string(&[serde_json::json!({
+        "name": email_address,
+        "address": email_address,
+    })])
+    .unwrap_or_else(|_| "[]".to_string());
+
+    let to_json = serde_json::to_string(
+        &to.split(',')
+            .filter_map(|a| {
+                let a = a.trim();
+                if a.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::json!({"name": "", "address": a}))
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_string());
+
+    let cc_json = cc
+        .map(|c| {
+            serde_json::to_string(
+                &c.split(',')
+                    .filter_map(|a| {
+                        let a = a.trim();
+                        if a.is_empty() {
+                            None
+                        } else {
+                            Some(serde_json::json!({"name": "", "address": a}))
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| "[]".to_string())
+        })
+        .unwrap_or_else(|| "[]".to_string());
+
+    let bcc_json = bcc
+        .map(|b| {
+            serde_json::to_string(
+                &b.split(',')
+                    .filter_map(|a| {
+                        let a = a.trim();
+                        if a.is_empty() {
+                            None
+                        } else {
+                            Some(serde_json::json!({"name": "", "address": a}))
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| "[]".to_string())
+        })
+        .unwrap_or_else(|| "[]".to_string());
+
+    let now = chrono::Utc::now().timestamp();
+    let message_id = format!("<sent-{}-{}@p0mail>", now, account_id);
+
+    let references_json = references
+        .as_ref()
+        .map(|r| serde_json::to_string(r).unwrap_or_default());
+
+    let conn = db::get()?;
+    conn.execute(
+        "INSERT INTO emails \
+         (thread_id, account_id, imap_uid, message_id, in_reply_to, \
+          \"references\", subject, from_json, to_json, cc_json, bcc_json, \
+          date_rfc2822, received_at, body_text, body_html, is_read, folder, labels) \
+         VALUES (NULL, ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, 'Sent', '[]')",
+        rusqlite::params![
+            account_id,
+            message_id,
+            in_reply_to,
+            references_json,
+            subject,
+            from_json,
+            to_json,
+            cc_json,
+            bcc_json,
+            "",
+            now,
+            body_text,
+            body_html,
+        ],
+    )
+    .map_err(|e| format!("Failed to insert sent copy: {}", e))?;
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -934,6 +1156,105 @@ fn get_send_queue() -> Result<Vec<models::SendQueueItem>, String> {
         .filter_map(|r| r.ok())
         .collect();
     Ok(items)
+}
+
+#[tauri::command]
+fn save_draft(
+    account_id: i64,
+    to: String,
+    cc: Option<String>,
+    bcc: Option<String>,
+    subject: String,
+    body_html: String,
+    body_text: String,
+    draft_id: Option<i64>,
+) -> Result<i64, String> {
+    let now = chrono::Utc::now().timestamp();
+    let conn = db::get()?;
+
+    if let Some(id) = draft_id {
+        let updated = conn.execute(
+            "UPDATE send_queue SET to_json = ?1, cc_json = ?2, bcc_json = ?3, \
+             subject = ?4, body_html = ?5, body_text = ?6, updated_at = ?7 \
+             WHERE id = ?8 AND status = 'draft'",
+            rusqlite::params![to, cc, bcc, subject, body_html, body_text, now, id],
+        )
+        .map_err(|e| format!("Failed to update draft: {}", e))?;
+
+        if updated > 0 {
+            return Ok(id);
+        }
+    }
+
+    conn.execute(
+        "INSERT INTO send_queue \
+         (account_id, to_json, cc_json, bcc_json, subject, body_html, body_text, \
+          status, retry_count, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'draft', 0, ?8, ?8)",
+        rusqlite::params![account_id, to, cc, bcc, subject, body_html, body_text, now],
+    )
+    .map_err(|e| format!("Failed to insert draft: {}", e))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+#[tauri::command]
+fn list_drafts(account_id: Option<i64>) -> Result<Vec<models::SendQueueItem>, String> {
+    let conn = db::get()?;
+    let sql = match account_id {
+        Some(_) => "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
+                    body_html, body_text, attachments_meta, status, retry_count, \
+                    created_at, sent_at FROM send_queue WHERE status = 'draft' \
+                    AND account_id = ?1 ORDER BY updated_at DESC",
+        None => "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
+                 body_html, body_text, attachments_meta, status, retry_count, \
+                 created_at, sent_at FROM send_queue WHERE status = 'draft' \
+                 ORDER BY updated_at DESC",
+    };
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let rows = match account_id {
+        Some(aid) => stmt
+            .query_map(rusqlite::params![aid], map_send_queue_row)
+            .map_err(|e| e.to_string())?,
+        None => stmt
+            .query_map([], map_send_queue_row)
+            .map_err(|e| e.to_string())?,
+    };
+    let items: Vec<models::SendQueueItem> = rows.filter_map(|r| r.ok()).collect();
+    Ok(items)
+}
+
+#[tauri::command]
+fn delete_draft(draft_id: i64) -> Result<(), String> {
+    let conn = db::get()?;
+    conn.execute(
+        "DELETE FROM send_queue WHERE id = ?1 AND status = 'draft'",
+        rusqlite::params![draft_id],
+    )
+    .map_err(|e| format!("Failed to delete draft: {}", e))?;
+    Ok(())
+}
+
+fn map_send_queue_row(row: &rusqlite::Row) -> rusqlite::Result<models::SendQueueItem> {
+    let to_str: String = row.get(2)?;
+    let cc_str: Option<String> = row.get(3)?;
+    let bcc_str: Option<String> = row.get(4)?;
+    let att_str: Option<String> = row.get(8)?;
+    Ok(models::SendQueueItem {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        to_field: serde_json::from_str(&to_str).unwrap_or_default(),
+        cc_field: cc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+        bcc_field: bcc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+        subject: row.get(5)?,
+        body_html: row.get(6)?,
+        body_text: row.get(7)?,
+        attachments_meta: att_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+        status: row.get(9)?,
+        retry_count: row.get(10)?,
+        created_at: row.get(11)?,
+        sent_at: row.get(12)?,
+    })
 }
 
 #[tauri::command]
@@ -1109,32 +1430,29 @@ async fn stream_chat_about_emails(
 }
 
 #[tauri::command]
-fn is_online() -> Result<bool, String> {
-    Ok(reqwest::blocking::Client::new()
-        .head("https://www.google.com")
+async fn is_online() -> Result<bool, String> {
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(client
+        .head("https://www.google.com")
         .send()
+        .await
         .is_ok())
 }
 
 #[tauri::command]
 async fn validate_imap_connection(params: ImapAccountParams) -> Result<bool, String> {
-    let port = oauth::find_available_port()?;
-    let _ = port;
-
-    let account_id: i64 = 0;
-    secure::store_imap_password(account_id, &params.password)?;
-
-    let result = imap_client::ImapConnection::connect_plain(
-        account_id,
+    let result = imap_client::ImapConnection::connect_plain_with_password(
         &params.imap_host,
         params.imap_port,
         &params.imap_encryption,
         &params.username,
+        &params.password,
     )
     .await;
-
-    let _ = secure::delete_secret(&format!("account_{}_imap_password", account_id));
 
     match result {
         Ok(mut session) => {
@@ -1208,9 +1526,219 @@ async fn fetch_email_body(email_id: i64) -> Result<(), String> {
         .map_err(|e| format!("SELECT failed: {:?}", e))?;
 
     let raw = imap_client::fetch_uid_message_raw(&mut session, uid as u32).await?;
-    drop(session);
+    imap_client::logout_session(&mut session).await;
     email_parse::apply_raw_message(email_id, &raw)?;
     Ok(())
+}
+
+#[tauri::command]
+async fn fetch_thread_bodies(thread_id: i64) -> Result<i64, String> {
+    let missing: Vec<(i64, i64, String, Option<i64>)> = {
+        let conn = db::get()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.id, e.account_id, e.folder, e.imap_uid \
+                 FROM emails e \
+                 WHERE e.thread_id = ?1 AND e.body_html IS NULL AND e.body_text IS NULL",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<(i64, i64, String, Option<i64>)> = stmt
+            .query_map(rusqlite::params![thread_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    };
+
+    if missing.is_empty() {
+        return Ok(0);
+    }
+
+    let account_id = missing[0].1;
+    let (provider_type, imap_host, imap_port, imap_encryption, email_address) = {
+        let conn = db::get()?;
+        conn.query_row(
+            "SELECT provider_type, imap_host, imap_port, imap_encryption, email_address \
+             FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    let host = match imap_host {
+        Some(h) => h,
+        None => return Ok(0),
+    };
+    let port = match imap_port {
+        Some(p) => p,
+        None => return Ok(0),
+    };
+    let encryption = match imap_encryption {
+        Some(e) => e,
+        None => return Ok(0),
+    };
+
+    let mut session = if provider_type == "gmail_oauth" || provider_type == "microsoft_oauth" {
+        let provider = oauth::OAuthProvider::from_str(&provider_type)
+            .ok_or_else(|| format!("Invalid provider: {}", provider_type))?;
+        imap_client::ImapConnection::connect_oauth(account_id, &provider, &email_address).await?
+    } else {
+        imap_client::ImapConnection::connect_plain(account_id, &host, port, &encryption, &email_address).await?
+    };
+
+    let mut fetched: i64 = 0;
+    let mut current_folder = String::new();
+
+    for (email_id, _account_id, folder, uid) in &missing {
+        let uid = match uid {
+            Some(u) => *u,
+            None => continue,
+        };
+
+        if *folder != current_folder {
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                session.select(folder),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false)
+            {
+                current_folder = folder.clone();
+            } else {
+                continue;
+            }
+        }
+
+        match imap_client::fetch_uid_message_raw(&mut session, uid as u32).await {
+            Ok(raw) => {
+                if email_parse::apply_raw_message(*email_id, &raw).is_ok() {
+                    fetched += 1;
+                }
+            }
+            Err(e) => log::warn!("Body fetch failed for email {}: {}", email_id, e),
+        }
+    }
+
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), session.logout()).await;
+    Ok(fetched)
+}
+
+#[tauri::command]
+async fn download_attachment(
+    email_id: i64,
+    part_index: String,
+    download_dir: String,
+) -> Result<String, String> {
+    let (account_id, folder, imap_uid, provider_type, imap_host, imap_port, imap_encryption, email_address) = {
+        let conn = db::get()?;
+        conn.query_row(
+            "SELECT e.account_id, e.folder, e.imap_uid, a.provider_type, \
+             a.imap_host, a.imap_port, a.imap_encryption, a.email_address \
+             FROM emails e JOIN accounts a ON e.account_id = a.id \
+             WHERE e.id = ?1",
+            rusqlite::params![email_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    let uid = match imap_uid {
+        Some(u) => u,
+        None => return Err("Email has no IMAP UID".to_string()),
+    };
+
+    let host = imap_host.ok_or("No IMAP host")?;
+    let port = imap_port.ok_or("No IMAP port")?;
+    let encryption = imap_encryption.ok_or("No IMAP encryption")?;
+
+    let mut session = if provider_type == "gmail_oauth" || provider_type == "microsoft_oauth" {
+        let provider = oauth::OAuthProvider::from_str(&provider_type)
+            .ok_or_else(|| format!("Invalid provider: {}", provider_type))?;
+        imap_client::ImapConnection::connect_oauth(account_id, &provider, &email_address).await?
+    } else {
+        imap_client::ImapConnection::connect_plain(account_id, &host, port, &encryption, &email_address).await?
+    };
+
+    session
+        .select(&folder)
+        .await
+        .map_err(|e| format!("SELECT failed: {:?}", e))?;
+
+    let raw = imap_client::fetch_uid_message_raw(&mut session, uid as u32).await?;
+    imap_client::logout_session(&mut session).await;
+
+    let (filename, _mime_type, data) =
+        email_parse::extract_attachment_by_index(&raw, &part_index)?;
+
+    let safe_filename = sanitize_filename(&filename);
+    let download_path = std::path::Path::new(&download_dir)
+        .join(&safe_filename);
+    let final_path = unique_path(&download_path);
+    std::fs::write(&final_path, &data)
+        .map_err(|e| format!("Failed to write attachment: {e}"))?;
+
+    Ok(final_path.to_string_lossy().to_string())
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_control() || matches!(c, '/' | '\\') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        "attachment".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn unique_path(path: &std::path::Path) -> std::path::PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = path.extension().map(|s| s.to_string_lossy().to_string());
+    for i in 1..1000 {
+        let new_name = match &ext {
+            Some(ext) => format!("{stem} ({i}).{ext}"),
+            None => format!("{stem} ({i})"),
+        };
+        let candidate = path.with_file_name(new_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
 }
 
 #[tauri::command]
@@ -1291,7 +1819,7 @@ async fn fetch_recent_bodies(account_id: i64, limit: i64) -> Result<i64, String>
         }
     }
 
-    drop(session);
+    imap_client::logout_session(&mut session).await;
     Ok(fetched)
 }
 
@@ -1304,6 +1832,7 @@ async fn queue_email(
     subject: String,
     body_html: String,
     body_text: String,
+    attachments: Option<Vec<models::AttachmentPayload>>,
     in_reply_to: Option<String>,
     references: Option<Vec<String>>,
 ) -> Result<(), String> {
@@ -1317,7 +1846,7 @@ async fn queue_email(
             &subject,
             &body_html,
             &body_text,
-            None,
+            attachments,
             in_reply_to.as_deref(),
             references,
         )
@@ -1330,11 +1859,29 @@ async fn process_send_queue() -> Result<(), String> {
     service.process_queue().await
 }
 
+fn show_fatal_error(msg: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let _ = Command::new("osascript")
+            .args(["-e", &format!("display dialog \"{msg}\" with title \"p0mail\" buttons \"OK\" default button 1 with icon stop")])
+            .spawn();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("FATAL: {msg}");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = dotenvy::dotenv();
     let _ = env_logger::try_init();
-    db::init().expect("Failed to initialize database");
+    if let Err(e) = db::init() {
+        eprintln!("Failed to initialize database: {e}");
+        show_fatal_error(&format!("Failed to initialize database.\n\nError: {e}\n\nThis may happen after updating the app. Try removing the keychain entry:\n  security delete-generic-password -s p0mail -a p0mail_db_key\n\nThen restart the app."));
+        return;
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -1343,10 +1890,20 @@ pub fn run() {
             let handle = app.handle().clone();
             let wake = Arc::new(tokio::sync::Notify::new());
             let wake_for_focus = wake.clone();
+            let last_focus_sync = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let last_focus_sync_clone = last_focus_sync.clone();
             if let Some(window) = app.get_webview_window("main") {
                 window.on_window_event(move |event| {
                     if let WindowEvent::Focused(true) = event {
-                        wake_for_focus.notify_one();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let last = last_focus_sync_clone.load(std::sync::atomic::Ordering::Relaxed);
+                        if now.saturating_sub(last) >= 30 {
+                            last_focus_sync_clone.store(now, std::sync::atomic::Ordering::Relaxed);
+                            wake_for_focus.notify_one();
+                        }
                     }
                 });
             }
@@ -1364,6 +1921,7 @@ pub fn run() {
             trigger_sync,
             set_account_sync_enabled,
             list_threads,
+            list_folders,
             get_emails,
             get_email,
             search_emails,
@@ -1373,11 +1931,16 @@ pub fn run() {
             delete_email,
             send_email,
             fetch_email_body,
+            fetch_thread_bodies,
+            download_attachment,
             fetch_recent_bodies,
             queue_email,
             process_send_queue,
             get_send_queue,
             retry_send_queue_item,
+            save_draft,
+            list_drafts,
+            delete_draft,
             get_ai_config,
             set_ai_config,
             validate_ai_endpoint,

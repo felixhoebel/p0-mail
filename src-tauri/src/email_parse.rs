@@ -1,4 +1,4 @@
-use mailparse::ParsedMail;
+use mailparse::{MailHeaderMap, ParsedMail};
 
 pub fn decode_header(value: &str) -> String {
     let trimmed = value.trim();
@@ -12,9 +12,19 @@ pub fn decode_header(value: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParsedAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    pub size_bytes: i64,
+    pub local_path: Option<String>,
+    pub part_index: String,
+}
+
 pub struct ParsedBodies {
     pub text: Option<String>,
     pub html: Option<String>,
+    pub attachments: Vec<ParsedAttachment>,
 }
 
 fn sanitize_html(html: &str) -> String {
@@ -45,8 +55,9 @@ pub fn extract_bodies(raw: &[u8]) -> Result<ParsedBodies, String> {
     let parsed = mailparse::parse_mail(raw).map_err(|e| format!("MIME parse failed: {e}"))?;
     let mut text = None;
     let mut html = None;
-    collect_parts(&parsed, &mut text, &mut html);
-    Ok(ParsedBodies { text, html })
+    let mut attachments = Vec::new();
+    collect_parts(&parsed, &mut text, &mut html, &mut attachments, "0");
+    Ok(ParsedBodies { text, html, attachments })
 }
 
 fn part_body_string(part: &ParsedMail) -> Option<String> {
@@ -62,7 +73,47 @@ fn part_body_string(part: &ParsedMail) -> Option<String> {
         })
 }
 
-fn collect_parts(part: &ParsedMail, text: &mut Option<String>, html: &mut Option<String>) {
+fn is_attachment_part(part: &ParsedMail) -> bool {
+    let mime = part.ctype.mimetype.to_ascii_lowercase();
+    if mime.starts_with("text/") {
+        return false;
+    }
+    if mime == "multipart/alternative" {
+        return false;
+    }
+    if part.get_content_disposition().disposition
+        == mailparse::DispositionType::Attachment
+    {
+        return true;
+    }
+    let cdisp = part.get_content_disposition();
+    if cdisp.disposition == mailparse::DispositionType::Inline {
+        return cdisp.params.contains_key("filename");
+    }
+    false
+}
+
+fn attachment_filename(part: &ParsedMail) -> String {
+    let cdisp = part.get_content_disposition();
+    if let Some(name) = cdisp.params.get("filename") {
+        return name.clone();
+    }
+    if let Some(name) = part.get_headers().get_first_value("Content-Type") {
+        let parsed_ct = mailparse::parse_content_type(&name);
+        if let Some(fname) = parsed_ct.params.get("name") {
+            return fname.clone();
+        }
+    }
+    "attachment".to_string()
+}
+
+fn collect_parts(
+    part: &ParsedMail,
+    text: &mut Option<String>,
+    html: &mut Option<String>,
+    attachments: &mut Vec<ParsedAttachment>,
+    path: &str,
+) {
     let mime = part.ctype.mimetype.to_ascii_lowercase();
 
     if mime == "text/plain" {
@@ -79,8 +130,21 @@ fn collect_parts(part: &ParsedMail, text: &mut Option<String>, html: &mut Option
         }
     }
 
-    for sub in &part.subparts {
-        collect_parts(sub, text, html);
+    if is_attachment_part(part) {
+        let filename = attachment_filename(part);
+        let size = part.get_body_raw().map(|b| b.len()).unwrap_or(0) as i64;
+        attachments.push(ParsedAttachment {
+            filename,
+            mime_type: part.ctype.mimetype.clone(),
+            size_bytes: size,
+            local_path: None,
+            part_index: path.to_string(),
+        });
+    }
+
+    for (i, sub) in part.subparts.iter().enumerate() {
+        let sub_path = format!("{path}.{i}");
+        collect_parts(sub, text, html, attachments, &sub_path);
     }
 }
 
@@ -90,9 +154,14 @@ pub fn store_bodies(
 ) -> Result<(), String> {
     let conn = crate::db::get()?;
     let sanitized_html = bodies.html.as_ref().map(|h| sanitize_html(h));
+    let attachments_json = if bodies.attachments.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&bodies.attachments).ok()
+    };
     conn.execute(
-        "UPDATE emails SET body_html = ?1, body_text = ?2 WHERE id = ?3",
-        rusqlite::params![sanitized_html, bodies.text, email_id],
+        "UPDATE emails SET body_html = ?1, body_text = ?2, attachments_meta = ?3 WHERE id = ?4",
+        rusqlite::params![sanitized_html, bodies.text, attachments_json, email_id],
     )
     .map_err(|e| format!("Failed to update email body: {e}"))?;
     Ok(())
@@ -106,6 +175,28 @@ pub fn apply_raw_message(email_id: i64, raw: &[u8]) -> Result<(), String> {
         Ok(_) => Err("Message contained no text or HTML body".to_string()),
         Err(e) => Err(e),
     }
+}
+
+pub fn extract_attachment_by_index(raw: &[u8], part_index: &str) -> Result<(String, String, Vec<u8>), String> {
+    let parsed = mailparse::parse_mail(raw).map_err(|e| format!("MIME parse failed: {e}"))?;
+    let indices: Vec<usize> = part_index
+        .split('.')
+        .skip(1)
+        .filter_map(|s| s.parse().ok())
+        .collect();
+
+    let mut current = &parsed;
+    for &idx in &indices {
+        if idx >= current.subparts.len() {
+            return Err(format!("Invalid part index: {part_index}"));
+        }
+        current = &current.subparts[idx];
+    }
+
+    let filename = attachment_filename(current);
+    let mime_type = current.ctype.mimetype.clone();
+    let data = current.get_body_raw().map_err(|e| format!("Failed to read attachment body: {e}"))?;
+    Ok((filename, mime_type, data))
 }
 
 pub fn strip_html_tags(html: &str) -> String {
@@ -236,6 +327,65 @@ mod tests {
         let clean = sanitize_html(html);
         assert!(clean.contains("https://example.com"));
         assert!(clean.contains("link"));
+    }
+
+    #[test]
+    fn extracts_attachment_metadata() {
+        let raw = concat!(
+            "From: a@b.com\r\n",
+            "To: c@d.com\r\n",
+            "Subject: with attachment\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=mixed\r\n",
+            "\r\n",
+            "--mixed\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "Hello\r\n",
+            "--mixed\r\n",
+            "Content-Type: application/pdf\r\n",
+            "Content-Disposition: attachment; filename=\"doc.pdf\"\r\n",
+            "\r\n",
+            "PDFDATA\r\n",
+            "--mixed--\r\n",
+        );
+        let bodies = extract_bodies(raw.as_bytes()).unwrap();
+        assert_eq!(bodies.text.as_deref(), Some("Hello"));
+        assert_eq!(bodies.attachments.len(), 1);
+        let att = &bodies.attachments[0];
+        assert_eq!(att.filename, "doc.pdf");
+        assert_eq!(att.mime_type, "application/pdf");
+        assert!(att.part_index.starts_with("0."));
+    }
+
+    #[test]
+    fn extracts_attachment_by_part_index() {
+        let raw = concat!(
+            "From: a@b.com\r\n",
+            "To: c@d.com\r\n",
+            "Subject: with attachment\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=mixed\r\n",
+            "\r\n",
+            "--mixed\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "Hello\r\n",
+            "--mixed\r\n",
+            "Content-Type: application/pdf\r\n",
+            "Content-Disposition: attachment; filename=\"doc.pdf\"\r\n",
+            "\r\n",
+            "PDFDATA\r\n",
+            "--mixed--\r\n",
+        );
+        let bodies = extract_bodies(raw.as_bytes()).unwrap();
+        assert_eq!(bodies.attachments.len(), 1);
+        let part_index = bodies.attachments[0].part_index.clone();
+        let (filename, mime_type, data) =
+            extract_attachment_by_index(raw.as_bytes(), &part_index).unwrap();
+        assert_eq!(filename, "doc.pdf");
+        assert_eq!(mime_type, "application/pdf");
+        assert!(String::from_utf8_lossy(&data).contains("PDFDATA"));
     }
 
     #[test]

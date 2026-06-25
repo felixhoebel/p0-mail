@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Folder {
+    pub id: i64,
+    pub account_id: i64,
+    pub name: String,
+    pub imap_name: String,
+    pub special_use: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Account {
     pub id: i64,
     pub provider_type: String,
@@ -15,6 +24,8 @@ pub struct Account {
     pub last_seen_uid: i64,
     pub created_at: i64,
     pub needs_reauth: bool,
+    pub sync_error: Option<String>,
+    pub sync_error_at: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -40,6 +51,14 @@ pub struct AttachmentMeta {
     pub mime_type: String,
     pub size_bytes: i64,
     pub local_path: Option<String>,
+    pub part_index: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AttachmentPayload {
+    pub filename: String,
+    pub mime_type: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

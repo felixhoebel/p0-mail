@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Account,
+  Folder,
   Thread,
   Email,
   SendQueueItem,
@@ -10,6 +11,7 @@ import type {
   ProviderType,
   EncryptionType,
   AiTone,
+  AttachmentPayload,
 } from "@/types";
 
 // Account Management
@@ -40,6 +42,10 @@ export async function addImapAccount(params: {
 
 export async function removeAccount(accountId: number): Promise<void> {
   return invoke("remove_account", { accountId });
+}
+
+export async function listFolders(accountId: number): Promise<Folder[]> {
+  return invoke("list_folders", { accountId });
 }
 
 export async function reauthOauthAccount(accountId: number): Promise<Account> {
@@ -80,6 +86,7 @@ export function onOpenThread(
 // Threads & Emails
 export async function listThreads(params: {
   accountId?: number;
+  folder?: string;
   limit?: number;
   offset?: number;
 }): Promise<Thread[]> {
@@ -125,7 +132,7 @@ export async function sendEmail(params: {
   subject: string;
   bodyHtml: string;
   bodyText: string;
-  attachments?: string[];
+  attachments?: AttachmentPayload[];
   inReplyTo?: string;
   references?: string[];
 }): Promise<void> {
@@ -140,6 +147,7 @@ export async function queueEmail(params: {
   subject: string;
   bodyHtml: string;
   bodyText: string;
+  attachments?: AttachmentPayload[];
   inReplyTo?: string;
   references?: string[];
 }): Promise<void> {
@@ -158,9 +166,42 @@ export async function retrySendQueueItem(queueId: number): Promise<void> {
   return invoke("retry_send_queue_item", { queueId });
 }
 
+export async function saveDraft(params: {
+  accountId: number;
+  to: string;
+  cc?: string;
+  bcc?: string;
+  subject: string;
+  bodyHtml: string;
+  bodyText: string;
+  draftId?: number;
+}): Promise<number> {
+  return invoke("save_draft", params);
+}
+
+export async function listDrafts(accountId?: number): Promise<SendQueueItem[]> {
+  return invoke("list_drafts", { accountId });
+}
+
+export async function deleteDraft(draftId: number): Promise<void> {
+  return invoke("delete_draft", { draftId });
+}
+
 // Body Fetch
 export async function fetchEmailBody(emailId: number): Promise<void> {
   return invoke("fetch_email_body", { emailId });
+}
+
+export async function fetchThreadBodies(threadId: number): Promise<number> {
+  return invoke("fetch_thread_bodies", { threadId });
+}
+
+export async function downloadAttachment(
+  emailId: number,
+  partIndex: string,
+  downloadDir: string,
+): Promise<string> {
+  return invoke("download_attachment", { emailId, partIndex, downloadDir });
 }
 
 export async function fetchRecentBodies(

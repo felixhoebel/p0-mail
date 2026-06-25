@@ -4,9 +4,13 @@ use crate::imap_client::ImapConnection;
 use crate::oauth::OAuthProvider;
 use crate::threading::ThreadingService;
 use futures::StreamExt;
+use std::time::Duration;
 
-const INITIAL_SYNC_LIMIT: u32 = 100;
-const MAX_EMAILS_PER_ACCOUNT: i64 = 100;
+const INITIAL_SYNC_LIMIT: u32 = 500;
+const MAX_EMAILS_PER_ACCOUNT: i64 = 50000;
+const SELECT_TIMEOUT: Duration = Duration::from_secs(10);
+const LIST_TIMEOUT: Duration = Duration::from_secs(10);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct AccountSyncResult {
     pub account_id: i64,
@@ -15,61 +19,174 @@ pub struct AccountSyncResult {
 
 pub struct SyncEngine;
 
+pub struct FolderInfo {
+    pub imap_name: String,
+}
+
 impl SyncEngine {
     pub fn new() -> Self {
         SyncEngine
     }
 
-    pub async fn sync_account(&self, account_id: i64) -> Result<i64, String> {
-        let (provider_type, imap_host, imap_port, imap_encryption, email_address) = {
+    async fn discover_folders(
+        &self,
+        session: &mut crate::imap_client::ImapSession,
+        account_id: i64,
+    ) -> Result<(), String> {
+        let existing: Vec<(String, String, Option<String>)> = {
             let conn = db::get()?;
-            conn.query_row(
-                "SELECT provider_type, imap_host, imap_port, imap_encryption, email_address \
-                 FROM accounts WHERE id = ?1",
-                rusqlite::params![account_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                },
-            )
-            .map_err(|e| e.to_string())?
+            let mut stmt = conn
+                .prepare("SELECT name, imap_name, special_use FROM folders WHERE account_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params![account_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+            rows
         };
 
-        let host = imap_host.ok_or("No IMAP host configured")?;
-        let port = imap_port.ok_or("No IMAP port configured")?;
-        let encryption = imap_encryption.ok_or("No IMAP encryption configured")?;
+        if !existing.is_empty() {
+            return Ok(());
+        }
 
-        let mut session = if provider_type == "gmail_oauth" || provider_type == "microsoft_oauth"
-        {
-            let provider = OAuthProvider::from_str(&provider_type)
-                .ok_or_else(|| format!("Invalid provider: {}", provider_type))?;
-            ImapConnection::connect_oauth(account_id, &provider, &email_address).await?
+        let mut folders: Vec<(String, String, Option<String>)> = Vec::new();
+        folders.push(("Inbox".to_string(), "INBOX".to_string(), Some("inbox".to_string())));
+
+        let list_result = tokio::time::timeout(LIST_TIMEOUT, session.list(None, Some("*"))).await;
+        if let Ok(Ok(list_stream)) = list_result {
+            let names_result = tokio::time::timeout(LIST_TIMEOUT, list_stream.collect::<Vec<_>>()).await;
+            let names = names_result.unwrap_or_default();
+            for name_result in names {
+                if let Ok(name) = name_result {
+                    let imap_name = name.name().to_string();
+                    if imap_name.eq_ignore_ascii_case("INBOX") {
+                        continue;
+                    }
+                    if name
+                        .attributes()
+                        .iter()
+                        .any(|a| matches!(a, async_imap::types::NameAttribute::NoSelect))
+                    {
+                        continue;
+                    }
+                    let special_use = name
+                        .attributes()
+                        .iter()
+                        .find_map(|attr| match attr {
+                            async_imap::types::NameAttribute::Sent => Some("sent".to_string()),
+                            async_imap::types::NameAttribute::Drafts => Some("drafts".to_string()),
+                            async_imap::types::NameAttribute::Trash => Some("trash".to_string()),
+                            async_imap::types::NameAttribute::Junk => Some("spam".to_string()),
+                            async_imap::types::NameAttribute::Archive => Some("archive".to_string()),
+                            _ => None,
+                        });
+
+                    let display_name = special_use
+                        .as_ref()
+                        .map(|s| s.clone())
+                        .unwrap_or_else(|| imap_name.clone());
+
+                    folders.push((display_name, imap_name, special_use));
+                }
+            }
         } else {
-            ImapConnection::connect_plain(account_id, &host, port, &encryption, &email_address)
-                .await?
+            log::warn!("Folder LIST failed for account {}, falling back to INBOX only", account_id);
+        }
+
+        let conn = db::get()?;
+        for (name, imap_name, special_use) in &folders {
+            conn.execute(
+                "INSERT OR IGNORE INTO folders (account_id, name, imap_name, special_use) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![account_id, name, imap_name, special_use],
+            )
+            .map_err(|e| format!("Failed to insert folder: {}", e))?;
+        }
+
+        Ok(())
+    }
+
+    fn get_folders(&self, account_id: i64) -> Result<Vec<FolderInfo>, String> {
+        let conn = db::get()?;
+        let mut stmt = conn
+            .prepare("SELECT id, name, imap_name, special_use FROM folders WHERE account_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![account_id], |row| {
+                let imap_name: String = row.get(2)?;
+                Ok(FolderInfo { imap_name })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    fn get_folder_last_uid(&self, account_id: i64, folder: &str) -> Result<i64, String> {
+        let conn = db::get()?;
+        Ok(conn
+            .query_row(
+                "SELECT last_seen_uid FROM folder_sync_state WHERE account_id = ?1 AND folder = ?2",
+                rusqlite::params![account_id, folder],
+                |row| row.get(0),
+            )
+            .unwrap_or(0))
+    }
+
+    fn set_folder_last_uid(&self, account_id: i64, folder: &str, uid: i64) -> Result<(), String> {
+        let conn = db::get()?;
+        conn.execute(
+            "INSERT INTO folder_sync_state (account_id, folder, last_seen_uid) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(account_id, folder) DO UPDATE SET last_seen_uid = ?3",
+            rusqlite::params![account_id, folder, uid],
+        )
+        .map_err(|e| format!("Failed to update folder UID: {}", e))?;
+        Ok(())
+    }
+
+    async fn sync_folder(
+        &self,
+        session: &mut crate::imap_client::ImapSession,
+        account_id: i64,
+        folder: &FolderInfo,
+    ) -> Result<i64, String> {
+        let mailbox = match tokio::time::timeout(SELECT_TIMEOUT, session.select(&folder.imap_name))
+            .await
+        {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                log::warn!(
+                    "Failed to select folder '{}' for account {}: {:?}",
+                    folder.imap_name,
+                    account_id,
+                    e
+                );
+                return Ok(0);
+            }
+            Err(_) => {
+                log::warn!(
+                    "Select folder '{}' timed out for account {}",
+                    folder.imap_name,
+                    account_id
+                );
+                return Ok(0);
+            }
         };
 
-        let mailbox = session
-            .select("INBOX")
-            .await
-            .map_err(|e| format!("Failed to select INBOX: {:?}", e))?;
-
-        let last_uid = self.get_last_uid(account_id)?;
+        let last_uid = self.get_folder_last_uid(account_id, &folder.imap_name)?;
         let fetch_query = "(UID FLAGS ENVELOPE BODY.PEEK[HEADER.FIELDS (REFERENCES)])";
 
         let collected: Vec<_> = if last_uid > 0 {
             let criteria = format!("{}:*", last_uid + 1);
-            session
-                .uid_fetch(&criteria, fetch_query)
+            let fetch_stream = tokio::time::timeout(FETCH_TIMEOUT, session.uid_fetch(&criteria, fetch_query))
                 .await
-                .map_err(|e| format!("UID FETCH failed: {:?}", e))?
-                .collect::<Vec<_>>()
+                .map_err(|_| format!("UID FETCH timed out after {FETCH_TIMEOUT:?}"))?
+                .map_err(|e| format!("UID FETCH failed: {:?}", e))?;
+            tokio::time::timeout(FETCH_TIMEOUT, fetch_stream.collect::<Vec<_>>())
                 .await
+                .map_err(|_| format!("UID FETCH stream timed out after {FETCH_TIMEOUT:?}"))?
         } else if mailbox.exists == 0 {
             return Ok(0);
         } else {
@@ -79,24 +196,42 @@ impl SyncEngine {
                 .max(1);
             let criteria = format!("{seq_start}:*");
             log::info!(
-                "Initial sync account {}: fetching last {} of {} messages (seq {}:*)",
+                "Initial sync account {}/{}: fetching last {} of {} messages (seq {}:*)",
                 account_id,
+                folder.imap_name,
                 INITIAL_SYNC_LIMIT.min(mailbox.exists),
                 mailbox.exists,
                 seq_start
             );
-            session
-                .fetch(&criteria, fetch_query)
+            let fetch_stream = tokio::time::timeout(FETCH_TIMEOUT, session.fetch(&criteria, fetch_query))
                 .await
-                .map_err(|e| format!("FETCH failed: {:?}", e))?
-                .collect::<Vec<_>>()
+                .map_err(|_| format!("FETCH timed out after {FETCH_TIMEOUT:?}"))?
+                .map_err(|e| format!("FETCH failed: {:?}", e))?;
+            tokio::time::timeout(FETCH_TIMEOUT, fetch_stream.collect::<Vec<_>>())
                 .await
+                .map_err(|_| format!("FETCH stream timed out after {FETCH_TIMEOUT:?}"))?
         };
-
-        drop(session);
 
         let mut max_uid: i64 = last_uid;
         let mut new_count: i64 = 0;
+
+        struct PendingEmail {
+            uid: i64,
+            message_id: String,
+            in_reply_to: Option<String>,
+            references_json: Option<String>,
+            subject: Option<String>,
+            from_json: String,
+            to_json: String,
+            cc_json: String,
+            bcc_json: String,
+            date_rfc2822: Option<String>,
+            received_at: i64,
+            is_read: bool,
+            labels_json: String,
+        }
+
+        let mut pending: Vec<PendingEmail> = Vec::new();
 
         for fetch_result in collected {
             let fetch = match fetch_result {
@@ -125,24 +260,6 @@ impl SyncEngine {
                 .as_ref()
                 .map(|v| String::from_utf8_lossy(v).to_string())
                 .unwrap_or_else(|| format!("<no-message-id-{}>", uid));
-
-            let existing = {
-                let conn = db::get()?;
-                let count: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM emails WHERE account_id = ?1 AND message_id = ?2",
-                        rusqlite::params![account_id, message_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                count
-            };
-            if existing > 0 {
-                if uid > max_uid {
-                    max_uid = uid;
-                }
-                continue;
-            }
 
             let subject = envelope
                 .subject
@@ -182,73 +299,192 @@ impl SyncEngine {
                 .collect();
             let labels_json = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string());
 
-            let body_text: Option<String> = None;
-            let body_html: Option<String> = None;
-
             let references_json = references
                 .as_ref()
                 .map(|r| serde_json::to_string(r).unwrap_or_default());
 
-            {
-                let conn = db::get()?;
-                conn.execute(
-                    "INSERT INTO emails \
-                      (thread_id, account_id, imap_uid, message_id, in_reply_to, \
-                       \"references\", subject, from_json, to_json, cc_json, bcc_json, \
-                      date_rfc2822, received_at, body_text, body_html, is_read, folder, labels) \
-                     VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'INBOX', ?16)",
-                    rusqlite::params![
-                        account_id,
-                        uid,
-                        message_id,
-                        in_reply_to,
-                        references_json,
-                        subject,
-                        from_json,
-                        to_json,
-                        cc_json,
-                        bcc_json,
-                        date_rfc2822,
-                        received_at,
-                        body_text,
-                        body_html,
-                        is_read as i64,
-                        labels_json,
-                    ],
-                )
-                .map_err(|e| format!("Failed to insert email: {}", e))?;
-            }
-
             if uid > max_uid {
                 max_uid = uid;
             }
-            new_count += 1;
+
+            pending.push(PendingEmail {
+                uid,
+                message_id,
+                in_reply_to,
+                references_json,
+                subject,
+                from_json,
+                to_json,
+                cc_json,
+                bcc_json,
+                date_rfc2822,
+                received_at,
+                is_read,
+                labels_json,
+            });
+        }
+
+        if !pending.is_empty() {
+            let existing_ids: std::collections::HashSet<String> = {
+                let conn = db::get()?;
+                let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for chunk in pending.chunks(500) {
+                    let placeholders = std::iter::repeat("?")
+                        .take(chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT message_id FROM emails WHERE account_id = ?1 AND message_id IN ({})",
+                        placeholders
+                    );
+                    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                        vec![Box::new(account_id)];
+                    for p in chunk {
+                        params.push(Box::new(p.message_id.clone()));
+                    }
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        params.iter().map(|p| p.as_ref()).collect();
+                    let chunk_ids: std::collections::HashSet<String> = stmt
+                        .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+                        .map_err(|e| e.to_string())?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    ids.extend(chunk_ids);
+                }
+                ids
+            };
+
+            let to_insert: Vec<&PendingEmail> = pending
+                .iter()
+                .filter(|p| !existing_ids.contains(&p.message_id))
+                .collect();
+
+            if !to_insert.is_empty() {
+                let mut conn = db::get()?;
+                let tx = conn.transaction().map_err(|e| e.to_string())?;
+                {
+                    let mut stmt = tx.prepare(
+                        "INSERT INTO emails \
+                         (thread_id, account_id, imap_uid, message_id, in_reply_to, \
+                          \"references\", subject, from_json, to_json, cc_json, bcc_json, \
+                         date_rfc2822, received_at, body_text, body_html, is_read, folder, labels) \
+                         VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    ).map_err(|e| e.to_string())?;
+                    for p in &to_insert {
+                        stmt.execute(rusqlite::params![
+                            account_id,
+                            p.uid,
+                            p.message_id,
+                            p.in_reply_to,
+                            p.references_json,
+                            p.subject,
+                            p.from_json,
+                            p.to_json,
+                            p.cc_json,
+                            p.bcc_json,
+                            p.date_rfc2822,
+                            p.received_at,
+                            None::<String>,
+                            None::<String>,
+                            p.is_read as i64,
+                            folder.imap_name,
+                            p.labels_json,
+                        ])
+                        .map_err(|e| format!("Failed to insert email: {}", e))?;
+                    }
+                }
+                tx.commit().map_err(|e| e.to_string())?;
+                new_count = to_insert.len() as i64;
+            }
         }
 
         if max_uid > last_uid {
-            let conn = db::get()?;
-            conn.execute(
-                "UPDATE accounts SET last_seen_uid = ?1 WHERE id = ?2",
-                rusqlite::params![max_uid, account_id],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-
-        if new_count > 0 {
-            let threading = ThreadingService::new();
-            threading.rebuild_threads_for_account(account_id)?;
-
-            self.enforce_email_limit(account_id)?;
+            self.set_folder_last_uid(account_id, &folder.imap_name, max_uid)?;
         }
 
         log::info!(
-            "Synced account {}: {} new emails, max UID {}",
+            "Synced account {}/{}: {} new emails, max UID {}",
             account_id,
+            folder.imap_name,
             new_count,
             max_uid
         );
 
         Ok(new_count)
+    }
+
+    pub async fn sync_account(&self, account_id: i64) -> Result<i64, String> {
+        let (provider_type, imap_host, imap_port, imap_encryption, email_address) = {
+            let conn = db::get()?;
+            conn.query_row(
+                "SELECT provider_type, imap_host, imap_port, imap_encryption, email_address \
+                 FROM accounts WHERE id = ?1",
+                rusqlite::params![account_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?
+        };
+
+        let host = imap_host.ok_or("No IMAP host configured")?;
+        let port = imap_port.ok_or("No IMAP port configured")?;
+        let encryption = imap_encryption.ok_or("No IMAP encryption configured")?;
+
+        let mut session = if provider_type == "gmail_oauth" || provider_type == "microsoft_oauth"
+        {
+            let provider = OAuthProvider::from_str(&provider_type)
+                .ok_or_else(|| format!("Invalid provider: {}", provider_type))?;
+            ImapConnection::connect_oauth(account_id, &provider, &email_address).await?
+        } else {
+            ImapConnection::connect_plain(account_id, &host, port, &encryption, &email_address)
+                .await?
+        };
+
+        self.discover_folders(&mut session, account_id).await?;
+
+        let folders = self.get_folders(account_id)?;
+        let mut total_new: i64 = 0;
+
+        for folder in &folders {
+            let new = self.sync_folder(&mut session, account_id, folder).await?;
+            total_new += new;
+        }
+
+        crate::imap_client::logout_session(&mut session).await;
+
+        if total_new > 0 {
+            let threading = ThreadingService::new();
+            let account_id_clone = account_id;
+            tokio::task::spawn_blocking(move || {
+                threading.rebuild_threads_for_account(account_id_clone)
+            })
+            .await
+            .map_err(|e| format!("Threading task panicked: {}", e))??;
+
+            let self_clone = SyncEngine::new();
+            tokio::task::spawn_blocking(move || {
+                self_clone.enforce_email_limit(account_id)
+            })
+            .await
+            .map_err(|e| format!("Enforce limit task panicked: {}", e))??;
+        }
+
+        log::info!(
+            "Synced account {}: {} new emails across {} folders",
+            account_id,
+            total_new,
+            folders.len()
+        );
+
+        Ok(total_new)
     }
 
     pub async fn sync_all(&self) -> Result<Vec<AccountSyncResult>, String> {
@@ -269,12 +505,16 @@ impl SyncEngine {
         let mut errors: Vec<String> = Vec::new();
         for id in account_ids {
             match self.sync_account(id).await {
-                Ok(new_count) => results.push(AccountSyncResult {
-                    account_id: id,
-                    new_count,
-                }),
+                Ok(new_count) => {
+                    Self::clear_sync_error(id).ok();
+                    results.push(AccountSyncResult {
+                        account_id: id,
+                        new_count,
+                    });
+                }
                 Err(e) => {
                     log::error!("Sync failed for account {}: {}", id, e);
+                    Self::set_sync_error(id, &e).ok();
                     errors.push(format!("Account {id}: {e}"));
                 }
             }
@@ -287,15 +527,24 @@ impl SyncEngine {
         }
     }
 
-    fn get_last_uid(&self, account_id: i64) -> Result<i64, String> {
+    pub fn set_sync_error(account_id: i64, error: &str) -> Result<(), String> {
         let conn = db::get()?;
-        Ok(conn
-            .query_row(
-                "SELECT last_seen_uid FROM accounts WHERE id = ?1",
-                rusqlite::params![account_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0))
+        conn.execute(
+            "UPDATE accounts SET sync_error = ?1, sync_error_at = ?2 WHERE id = ?3",
+            rusqlite::params![error, chrono::Utc::now().timestamp(), account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn clear_sync_error(account_id: i64) -> Result<(), String> {
+        let conn = db::get()?;
+        conn.execute(
+            "UPDATE accounts SET sync_error = NULL, sync_error_at = NULL WHERE id = ?1",
+            rusqlite::params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     fn extract_references_from_body(body: Option<&[u8]>) -> Option<Vec<String>> {

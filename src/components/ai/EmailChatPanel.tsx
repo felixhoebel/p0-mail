@@ -96,7 +96,8 @@ export default function EmailChatPanel({
     setError(null);
     setInput("");
 
-    const history: ChatMessage[] = turns.map((t) => ({
+    const MAX_HISTORY = 20;
+    const history: ChatMessage[] = turns.slice(-MAX_HISTORY).map((t) => ({
       role: t.role,
       content: t.content,
     }));

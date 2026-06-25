@@ -30,12 +30,16 @@ export function useContextMenu() {
   useEffect(() => {
     if (!menu) return;
     const close = () => setMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
     window.addEventListener("click", close);
     window.addEventListener("contextmenu", close);
-    window.addEventListener("keydown", (e) => e.key === "Escape" && close);
+    window.addEventListener("keydown", onKey);
     return () => {
       window.removeEventListener("click", close);
       window.removeEventListener("contextmenu", close);
+      window.removeEventListener("keydown", onKey);
     };
   }, [menu]);
 

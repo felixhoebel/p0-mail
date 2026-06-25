@@ -195,7 +195,29 @@ function ImapForm({ onAdded }: { onAdded: () => void }) {
   const update = (field: string, value: string) =>
     setForm((prev) => ({ ...prev, [field]: value }));
 
+  const validateForm = (): string | null => {
+    if (!form.displayName.trim()) return "Display name is required";
+    if (!form.emailAddress.trim() || !form.emailAddress.includes("@"))
+      return "A valid email address is required";
+    if (!form.imapHost.trim()) return "IMAP host is required";
+    const imapPort = parseInt(form.imapPort);
+    if (isNaN(imapPort) || imapPort < 1 || imapPort > 65535)
+      return "IMAP port must be between 1 and 65535";
+    if (!form.smtpHost.trim()) return "SMTP host is required";
+    const smtpPort = parseInt(form.smtpPort);
+    if (isNaN(smtpPort) || smtpPort < 1 || smtpPort > 65535)
+      return "SMTP port must be between 1 and 65535";
+    if (!form.username.trim()) return "Username is required";
+    if (!form.password) return "Password is required";
+    return null;
+  };
+
   const handleValidate = async () => {
+    const validationError = validateForm();
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
     setValidating(true);
     setError(null);
     setValidated(false);
@@ -215,6 +237,11 @@ function ImapForm({ onAdded }: { onAdded: () => void }) {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    const validationError = validateForm();
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
     setAdding(true);
     setError(null);
     try {

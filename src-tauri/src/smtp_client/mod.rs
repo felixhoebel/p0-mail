@@ -1,7 +1,12 @@
+use crate::commands::models::AttachmentPayload;
 use crate::secure;
 use lettre::message::header::{ContentType, InReplyTo, References};
+use lettre::message::{Attachment as LettreAttachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use std::time::Duration;
+
+const SMTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct SmtpConnection;
 
@@ -18,6 +23,7 @@ impl SmtpConnection {
         subject: &str,
         body_html: &str,
         body_text: &str,
+        attachments: Option<&[AttachmentPayload]>,
         in_reply_to: Option<&str>,
         references: Option<&[String]>,
     ) -> Result<(), String> {
@@ -26,11 +32,11 @@ impl SmtpConnection {
 
         let mailer = build_oauth_smtp_transport(host, port, encryption, &creds)?;
 
-        let message = build_message(email, to, cc, bcc, subject, body_html, body_text, in_reply_to, references)?;
+        let message = build_message(email, to, cc, bcc, subject, body_html, body_text, attachments, in_reply_to, references)?;
 
-        mailer
-            .send(message)
+        tokio::time::timeout(SMTP_TIMEOUT, mailer.send(message))
             .await
+            .map_err(|_| format!("SMTP send timed out after {SMTP_TIMEOUT:?}"))?
             .map_err(|e| format!("SMTP send failed: {}", e))?;
 
         Ok(())
@@ -48,6 +54,7 @@ impl SmtpConnection {
         subject: &str,
         body_html: &str,
         body_text: &str,
+        attachments: Option<&[AttachmentPayload]>,
         in_reply_to: Option<&str>,
         references: Option<&[String]>,
     ) -> Result<(), String> {
@@ -56,11 +63,11 @@ impl SmtpConnection {
 
         let mailer = build_smtp_transport(host, port, encryption, &creds)?;
 
-        let message = build_message(username, to, cc, bcc, subject, body_html, body_text, in_reply_to, references)?;
+        let message = build_message(username, to, cc, bcc, subject, body_html, body_text, attachments, in_reply_to, references)?;
 
-        mailer
-            .send(message)
+        tokio::time::timeout(SMTP_TIMEOUT, mailer.send(message))
             .await
+            .map_err(|_| format!("SMTP send timed out after {SMTP_TIMEOUT:?}"))?
             .map_err(|e| format!("SMTP send failed: {}", e))?;
 
         Ok(())
@@ -78,12 +85,14 @@ fn build_oauth_smtp_transport(
         "SSL" => Ok(AsyncSmtpTransport::<Tokio1Executor>::relay(host)
             .map_err(|e| format!("SMTP TLS relay error: {}", e))?
             .port(port as u16)
+            .timeout(Some(SMTP_TIMEOUT))
             .credentials(creds.clone())
             .authentication(mechanisms)
             .build()),
         "STARTTLS" => Ok(AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
             .map_err(|e| format!("SMTP STARTTLS relay error: {}", e))?
             .port(port as u16)
+            .timeout(Some(SMTP_TIMEOUT))
             .credentials(creds.clone())
             .authentication(mechanisms)
             .build()),
@@ -101,11 +110,13 @@ fn build_smtp_transport(
         "SSL" => Ok(AsyncSmtpTransport::<Tokio1Executor>::relay(host)
             .map_err(|e| format!("SMTP TLS relay error: {}", e))?
             .port(port as u16)
+            .timeout(Some(SMTP_TIMEOUT))
             .credentials(creds.clone())
             .build()),
         "STARTTLS" => Ok(AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
             .map_err(|e| format!("SMTP STARTTLS relay error: {}", e))?
             .port(port as u16)
+            .timeout(Some(SMTP_TIMEOUT))
             .credentials(creds.clone())
             .build()),
         _ => Err(format!("Unknown encryption: {}", encryption)),
@@ -120,6 +131,7 @@ fn build_message(
     subject: &str,
     body_html: &str,
     body_text: &str,
+    attachments: Option<&[AttachmentPayload]>,
     in_reply_to: Option<&str>,
     references: Option<&[String]>,
 ) -> Result<Message, String> {
@@ -163,19 +175,34 @@ fn build_message(
         builder = builder.header(References::from(refs_str));
     }
 
-    let multipart = lettre::message::MultiPart::alternative()
+    let alternative = MultiPart::alternative()
         .singlepart(
-            lettre::message::SinglePart::builder()
+            SinglePart::builder()
                 .header(ContentType::TEXT_PLAIN)
                 .body(body_text.to_string()),
         )
         .singlepart(
-            lettre::message::SinglePart::builder()
+            SinglePart::builder()
                 .header(ContentType::TEXT_HTML)
                 .body(body_html.to_string()),
         );
 
+    let body = match attachments {
+        Some(atts) if !atts.is_empty() => {
+            let mut mixed = MultiPart::mixed().multipart(alternative);
+            for att in atts {
+                let content_type = ContentType::parse(&att.mime_type)
+                    .unwrap_or(ContentType::TEXT_PLAIN);
+                let attachment = LettreAttachment::new(att.filename.clone())
+                    .body(att.data.clone(), content_type);
+                mixed = mixed.singlepart(attachment);
+            }
+            mixed
+        }
+        _ => alternative,
+    };
+
     builder
-        .multipart(multipart)
+        .multipart(body)
         .map_err(|e| format!("Failed to build message: {}", e))
 }

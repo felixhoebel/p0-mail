@@ -267,16 +267,16 @@ When picking up a task:
 - [x] 1.3 SQLCipher
 - [x] 1.4 FTS fix
 - [x] 1.5 CI signing
-- [ ] 2.1 Attachments
-- [ ] 2.2 Folders
-- [ ] 2.3 Drafts
-- [ ] 2.4 Reply-all/forward
-- [ ] 2.5 Cache + virtualize
-- [ ] 3.1 Non-blocking online
-- [ ] 3.2 Error boundary
-- [ ] 3.3 Sync health
-- [ ] 3.4 IMAP validation leak
-- [ ] 3.5 Input validation
+- [x] 2.1 Attachments
+- [x] 2.2 Folders
+- [x] 2.3 Drafts
+- [x] 2.4 Reply-all/forward
+- [x] 2.5 Cache + virtualize
+- [x] 3.1 Non-blocking online
+- [x] 3.2 Error boundary
+- [x] 3.3 Sync health
+- [x] 3.4 IMAP validation leak
+- [x] 3.5 Input validation
 - [ ] 4.1 Command palette
 - [ ] 4.2 Undo send
 - [ ] 4.3 Schedule send

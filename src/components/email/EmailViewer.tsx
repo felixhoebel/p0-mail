@@ -1,7 +1,9 @@
-import { useCallback, useMemo, useState, useRef, useEffect } from "react";
+import { useCallback, useMemo, useState } from "react";
 import DOMPurify from "dompurify";
+import { downloadDir } from "@tauri-apps/api/path";
 import { openExternalUrl, resolveEmailLink } from "@/lib/openExternal";
-import type { Email } from "@/types";
+import { downloadAttachment } from "@/lib/api";
+import type { Email, AttachmentMeta } from "@/types";
 
 interface EmailViewerProps {
   email: Email;
@@ -107,9 +109,81 @@ function initials(name: string): string {
   return (parts[0][0] + parts[1][0]).toUpperCase();
 }
 
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function attachmentIcon(mime: string): string {
+  if (mime.startsWith("image/")) return "\u{1F5BC}";
+  if (mime.startsWith("video/")) return "\u{1F3AC}";
+  if (mime.startsWith("audio/")) return "\u{1F3B5}";
+  if (mime === "application/pdf") return "\u{1F4D1}";
+  if (mime.includes("zip") || mime.includes("compressed")) return "\u{1F4E6}";
+  return "\u{1F4CE}";
+}
+
+function AttachmentChip({
+  attachment,
+  emailId,
+}: {
+  attachment: AttachmentMeta;
+  emailId: number;
+}) {
+  const [downloading, setDownloading] = useState(false);
+  const [downloadedPath, setDownloadedPath] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleDownload = useCallback(async () => {
+    if (!attachment.part_index) {
+      setError("Attachment not available for download");
+      return;
+    }
+    setDownloading(true);
+    setError(null);
+    try {
+      const dir = await downloadDir();
+      const path = await downloadAttachment(emailId, attachment.part_index, dir);
+      setDownloadedPath(path);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setDownloading(false);
+    }
+  }, [attachment.part_index, emailId]);
+
+  return (
+    <div className="inline-flex items-center gap-2 border border-border rounded-lg px-3 py-1.5 text-xs hover:border-primary/40 transition-colors">
+      <span className="text-base">{attachmentIcon(attachment.mime_type)}</span>
+      <div className="flex flex-col min-w-0">
+        <span className="font-medium truncate max-w-[180px]">
+          {attachment.filename}
+        </span>
+        <span className="text-muted-foreground text-[10px]">
+          {formatSize(attachment.size_bytes)}
+        </span>
+      </div>
+      {error ? (
+        <span className="text-red-500 text-[10px] ml-1" title={error}>!</span>
+      ) : downloadedPath ? (
+        <span className="text-emerald-500 text-[14px] ml-1" title={downloadedPath}>&#10003;</span>
+      ) : (
+        <button
+          onClick={handleDownload}
+          disabled={downloading}
+          className="ml-1 text-muted-foreground hover:text-foreground disabled:opacity-50 transition-colors"
+          title="Download"
+        >
+          {downloading ? "\u23F3" : "\u2B07"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 export default function EmailViewer({ email }: EmailViewerProps) {
   const [showImages, setShowImages] = useState(false);
-  const iframeRef = useRef<HTMLIFrameElement>(null);
 
   const hasBody = Boolean(email.body_html || email.body_text);
 
@@ -119,23 +193,28 @@ export default function EmailViewer({ email }: EmailViewerProps) {
     }
     const raw = email.body_html || email.body_text?.replace(/\n/g, "<br>") || "<em>No content</em>";
     let html = showImages ? raw : stripImages(raw);
-    DOMPurify.addHook("afterSanitizeAttributes", hardenEmailLinks);
-    const clean = DOMPurify.sanitize(html, SANITIZE_CONFIG);
-    DOMPurify.removeHook("afterSanitizeAttributes", hardenEmailLinks);
-    return clean;
+    try {
+      DOMPurify.addHook("afterSanitizeAttributes", hardenEmailLinks);
+      const clean = DOMPurify.sanitize(html, SANITIZE_CONFIG);
+      DOMPurify.removeHook("afterSanitizeAttributes", hardenEmailLinks);
+      return clean;
+    } catch {
+      const div = document.createElement("div");
+      div.textContent = raw;
+      return div.innerHTML;
+    }
   }, [email.body_html, email.body_text, showImages, hasBody]);
 
-  const handleClickInIframe = useCallback(async (e: MouseEvent) => {
+  const handleClickLink = useCallback((e: React.MouseEvent) => {
     const target = e.target as HTMLElement;
     const anchor = target.closest("a");
     if (!anchor) return;
     e.preventDefault();
-    e.stopPropagation();
     const href = anchor.getAttribute("href");
     if (!href) return;
     const url = resolveEmailLink(href);
     if (!url) return;
-    await openExternalUrl(url);
+    openExternalUrl(url).catch(() => {});
   }, []);
 
   const hasImages = useMemo(() => {
@@ -144,63 +223,6 @@ export default function EmailViewer({ email }: EmailViewerProps) {
   }, [email.body_html]);
 
   const senderName = email.from?.[0]?.name || email.from?.[0]?.address || "Unknown";
-
-  const iframeDoc = useMemo(() => {
-    return `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<base target="_blank">
-<style>
-  body { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; color: hsl(var(--foreground)); background: hsl(var(--background)); font-size: 14px; line-height: 1.6; margin: 0; padding: 0; word-wrap: break-word; }
-  a { color: #7c3aed; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  img { max-width: 100%; height: auto; }
-  table { border-collapse: collapse; max-width: 100%; }
-  pre { overflow-x: auto; }
-  .blocked-image { border: 1px dashed #999; padding: 8px; margin: 4px 0; color: #999; font-size: 12px; border-radius: 4px; }
-  blockquote { border-left: 3px solid hsl(var(--border)); margin: 0; padding-left: 12px; color: hsl(var(--muted-foreground)); }
-</style>
-</head>
-<body>${sanitizedHtml}</body>
-</html>`;
-  }, [sanitizedHtml]);
-
-  useEffect(() => {
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-    iframe.srcdoc = iframeDoc;
-  }, [iframeDoc]);
-
-  useEffect(() => {
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-
-    const handleLoad = () => {
-      try {
-        const doc = iframe.contentDocument;
-        if (!doc) return;
-        doc.addEventListener("click", handleClickInIframe);
-
-        const body = doc.body;
-        const resize = () => {
-          iframe.style.height = `${body.scrollHeight + 20}px`;
-        };
-        resize();
-        const observer = new MutationObserver(resize);
-        observer.observe(body, { childList: true, subtree: true, attributes: true });
-        return () => {
-          doc.removeEventListener("click", handleClickInIframe);
-          observer.disconnect();
-        };
-      } catch {
-        // cross-origin — skip
-      }
-    };
-
-    iframe.addEventListener("load", handleLoad);
-    return () => iframe.removeEventListener("load", handleLoad);
-  }, [handleClickInIframe, iframeDoc]);
 
   return (
     <div className="flex flex-col">
@@ -258,16 +280,25 @@ export default function EmailViewer({ email }: EmailViewerProps) {
         )}
       </div>
 
-      {/* Email body — sandboxed iframe for isolation */}
+      {/* Email body */}
       <div className="px-6 pb-6 pt-1">
-        <iframe
-          ref={iframeRef}
-          sandbox="allow-same-origin"
-          className="w-full border-0"
-          style={{ minHeight: "200px" }}
-          title="Email content"
+        <div
+          className="email-body prose prose-sm max-w-none"
+          dangerouslySetInnerHTML={{ __html: sanitizedHtml }}
+          onClick={handleClickLink}
         />
       </div>
+
+      {/* Attachments */}
+      {email.attachments_meta && email.attachments_meta.length > 0 && (
+        <div className="px-6 pb-6">
+          <div className="flex flex-wrap gap-2">
+            {email.attachments_meta.map((att, i) => (
+              <AttachmentChip key={`${att.filename}-${i}`} attachment={att} emailId={email.id} />
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

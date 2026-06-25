@@ -2,6 +2,15 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
+use std::time::Duration;
+
+fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))
+}
 
 pub const GOOGLE_AUTH_URL: &str =
     "https://accounts.google.com/o/oauth2/v2/auth";
@@ -190,7 +199,7 @@ impl OAuthFlow {
         redirect_port: u16,
     ) -> Result<OAuthTokens, String> {
         let redirect_uri = format!("http://127.0.0.1:{}", redirect_port);
-        let client = reqwest::Client::new();
+        let client = http_client()?;
 
         let mut params = vec![
             ("code", code.to_string()),
@@ -256,7 +265,7 @@ impl OAuthFlow {
                 resolve_google_email(access_token, None).await
             }
             OAuthProvider::Microsoft => {
-                let client = reqwest::Client::new();
+                let client = http_client()?;
                 let resp = client
                     .get("https://graph.microsoft.com/v1.0/me")
                     .bearer_auth(access_token)
@@ -355,7 +364,7 @@ pub async fn refresh_access_token(
     provider: &OAuthProvider,
     refresh_token: &str,
 ) -> Result<OAuthTokens, String> {
-    let client = reqwest::Client::new();
+    let client = http_client()?;
     let mut params = vec![
         ("client_id", provider.client_id()),
         ("client_secret", provider.client_secret()),
@@ -420,7 +429,7 @@ fn email_from_id_token(id_token: &str) -> Option<String> {
 }
 
 pub async fn fetch_google_userinfo_email(access_token: &str) -> Result<String, String> {
-    let client = reqwest::Client::new();
+    let client = http_client()?;
     let resp = client
         .get("https://www.googleapis.com/oauth2/v3/userinfo")
         .bearer_auth(access_token)
@@ -464,7 +473,7 @@ pub async fn resolve_google_email(
 }
 
 pub async fn fetch_gmail_email(access_token: &str) -> Result<String, String> {
-    let client = reqwest::Client::new();
+    let client = http_client()?;
     let resp = client
         .get("https://gmail.googleapis.com/gmail/v1/users/me/profile")
         .bearer_auth(access_token)
@@ -517,7 +526,7 @@ pub async fn ensure_oauth_email(
     let resolved = match provider {
         OAuthProvider::Gmail => resolve_google_email(&access_token, None).await?,
         OAuthProvider::Microsoft => {
-            let client = reqwest::Client::new();
+            let client = http_client()?;
             let resp = client
                 .get("https://graph.microsoft.com/v1.0/me")
                 .bearer_auth(&access_token)

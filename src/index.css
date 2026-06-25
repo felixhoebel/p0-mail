@@ -114,3 +114,12 @@
 .animate-slide-up {
   animation: slide-up 0.2s ease-out;
 }
+
+.email-body { font-size: 14px; line-height: 1.6; word-wrap: break-word; }
+.email-body a { color: #7c3aed; text-decoration: none; }
+.email-body a:hover { text-decoration: underline; }
+.email-body img { max-width: 100%; height: auto; }
+.email-body table { border-collapse: collapse; max-width: 100%; }
+.email-body pre { overflow-x: auto; }
+.email-body .blocked-image { border: 1px dashed #999; padding: 8px; margin: 4px 0; color: #999; font-size: 12px; border-radius: 4px; }
+.email-body blockquote { border-left: 3px solid var(--color-border); margin: 0; padding-left: 12px; color: var(--color-muted-foreground); }

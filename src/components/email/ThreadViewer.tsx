@@ -54,6 +54,7 @@ export default function ThreadViewer({
       subject: string;
       bodyHtml: string;
       bodyText: string;
+      attachments?: import("@/types").AttachmentPayload[];
       inReplyTo?: string;
       references?: string[];
     }) => {

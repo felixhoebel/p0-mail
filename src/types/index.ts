@@ -18,6 +18,16 @@ export interface Account {
   last_seen_uid: number;
   created_at: number;
   needs_reauth: boolean;
+  sync_error: string | null;
+  sync_error_at: number | null;
+}
+
+export interface Folder {
+  id: number;
+  account_id: number;
+  name: string;
+  imap_name: string;
+  special_use: string | null;
 }
 
 export interface Thread {
@@ -37,9 +47,16 @@ export interface EmailAddress {
 
 export interface AttachmentMeta {
   filename: string;
-  mimeType: string;
-  sizeBytes: number;
-  localPath?: string;
+  mime_type: string;
+  size_bytes: number;
+  local_path?: string | null;
+  part_index?: string;
+}
+
+export interface AttachmentPayload {
+  filename: string;
+  mime_type: string;
+  data: number[];
 }
 
 export interface Email {

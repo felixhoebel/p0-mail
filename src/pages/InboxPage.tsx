@@ -1,12 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Link } from "react-router-dom";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { Loader2, Settings, Search, RefreshCw, Archive, Trash2, MailOpen, Mail, PenSquare, Reply, CornerDownLeft, Sparkles, MessageSquare } from "lucide-react";
+import { Loader2, Settings, Search, RefreshCw, Archive, Trash2, MailOpen, Mail, PenSquare, Reply, ReplyAll, Forward, CornerDownLeft, Sparkles, MessageSquare } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   listAccounts,
   listThreads,
+  listFolders,
   triggerSync,
   searchEmails,
   markRead,
@@ -18,7 +19,7 @@ import {
   getSendQueue,
   fetchEmailBody,
   fetchRecentBodies,
-  isOnline,
+  fetchThreadBodies,
   getAiConfig,
   streamSummarizeThread,
   streamDraftReply,
@@ -26,9 +27,10 @@ import {
   onAiStreamError,
   onMailSynced,
 } from "@/lib/api";
-import type { Account, Thread, Email, SendQueueItem, AiConfig, AiTone } from "@/types";
+import type { Account, Folder, Thread, Email, SendQueueItem, AiConfig, AiTone, AttachmentPayload } from "@/types";
 import EmailViewer from "@/components/email/EmailViewer";
 import ComposeEditor from "@/components/email/ComposeEditor";
+import VirtualizedThreadList from "@/components/email/VirtualizedThreadList";
 import AiSummaryPanel from "@/components/ai/AiSummaryPanel";
 import AiActionButtons from "@/components/ai/AiActionButtons";
 import AiThinkingStrip from "@/components/ai/AiThinkingStrip";
@@ -41,6 +43,7 @@ import {
   getAiThinkingLabels,
 } from "@/lib/aiUi";
 import { plainTextToHtml } from "@/lib/plainTextToHtml";
+import { buildForwardBody, buildReplyQuoteBody } from "@/lib/quote";
 import { getEmails } from "@/lib/api";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
@@ -59,26 +62,6 @@ function formatDate(ts: number): string {
     });
   }
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
-
-function dateGroup(ts: number): string {
-  const d = new Date(ts * 1000);
-  const now = new Date();
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const yesterday = new Date(today.getTime() - 86400000);
-  const weekAgo = new Date(today.getTime() - 7 * 86400000);
-  const monthAgo = new Date(today.getTime() - 30 * 86400000);
-
-  if (d >= today) return "Today";
-  if (d >= yesterday) return "Yesterday";
-  if (d >= weekAgo) return "This Week";
-  if (d >= monthAgo) return "This Month";
-  return d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
-}
-
-function ThreadLabels({ thread }: { thread: Thread }) {
-  if (!thread.is_flagged) return null;
-  return <span className="text-amber-500 text-[11px]">&#9733;</span>;
 }
 
 function SendQueuePanel({ onClose }: { onClose: () => void }) {
@@ -350,6 +333,8 @@ function InlineReplyEditor({
 export default function InboxPage() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [selectedAccount, setSelectedAccount] = useState<number | null>(null);
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [selectedThread, setSelectedThread] = useState<number | null>(null);
   const [emails, setEmails] = useState<Email[]>([]);
@@ -361,6 +346,10 @@ export default function InboxPage() {
   const [composing, setComposing] = useState(false);
   const [sending, setSending] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
+  const [threadOffset, setThreadOffset] = useState(0);
+  const [hasMoreThreads, setHasMoreThreads] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const THREAD_PAGE_SIZE = 100;
   const [online, setOnline] = useState(true);
   const [pendingQueueCount, setPendingQueueCount] = useState(0);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -381,6 +370,14 @@ export default function InboxPage() {
   const [inlineReplySubject, setInlineReplySubject] = useState("");
   const [inlineReplyInReplyTo, setInlineReplyInReplyTo] = useState<string | undefined>();
   const [inlineReplyReferences, setInlineReplyReferences] = useState<string[] | undefined>();
+  const [inlineReplyQuoteHtml, setInlineReplyQuoteHtml] = useState<string | undefined>();
+
+  const [composeTo, setComposeTo] = useState("");
+  const [composeCc, setComposeCc] = useState("");
+  const [composeSubject, setComposeSubject] = useState("");
+  const [composeBodyHtml, setComposeBodyHtml] = useState<string | undefined>();
+  const [composeInReplyTo, setComposeInReplyTo] = useState<string | undefined>();
+  const [composeReferences, setComposeReferences] = useState<string[] | undefined>();
 
   const [aiDraftBody, setAiDraftBody] = useState<string | null>(null);
   const [showChat, setShowChat] = useState(false);
@@ -401,13 +398,16 @@ export default function InboxPage() {
   const activeStreamIdRef = useRef<string | null>(null);
   const activeStreamKindRef = useRef<"summary" | "reply" | null>(null);
 
+  const kbStateRef = useRef<Record<string, unknown>>({});
+
   const hydrateEmailBodies = useCallback(async (list: Email[]) => {
     const needsFetch = list.filter((e) => !e.body_html && !e.body_text);
     if (needsFetch.length === 0) return list;
-    await Promise.all(needsFetch.map((e) => fetchEmailBody(e.id).catch(() => {})));
     if (selectedThread && selectedThread > 0) {
+      await fetchThreadBodies(selectedThread).catch(() => {});
       return getEmails(selectedThread);
     }
+    await Promise.all(needsFetch.map((e) => fetchEmailBody(e.id).catch(() => {})));
     return Promise.all(
       list.map(async (e) => {
         if (e.body_html || e.body_text) return e;
@@ -419,12 +419,16 @@ export default function InboxPage() {
 
   useEffect(() => {
     listAccounts().then(setAccounts).catch(console.error);
-    isOnline().then(setOnline).catch(() => setOnline(false));
+    setOnline(navigator.onLine);
     getAiConfig().then(setAiConfig).catch(() => setAiConfig(null));
-    const interval = setInterval(() => {
-      isOnline().then(setOnline).catch(() => setOnline(false));
-    }, 30000);
-    return () => clearInterval(interval);
+    const handleOnline = () => setOnline(true);
+    const handleOffline = () => setOnline(false);
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
   }, []);
 
   useEffect(() => {
@@ -446,27 +450,68 @@ export default function InboxPage() {
   const loadThreads = useCallback(() => {
     listThreads({
       accountId: selectedAccount || undefined,
-      limit: 100,
+      folder: selectedFolder || undefined,
+      limit: THREAD_PAGE_SIZE,
     })
-      .then(setThreads)
+      .then((fetched) => {
+        setThreads(fetched);
+        setThreadOffset(fetched.length);
+        setHasMoreThreads(fetched.length === THREAD_PAGE_SIZE);
+      })
       .catch(console.error);
-  }, [selectedAccount]);
+  }, [selectedAccount, selectedFolder]);
+
+  const loadMoreThreads = useCallback(() => {
+    if (loadingMore || !hasMoreThreads) return;
+    setLoadingMore(true);
+    const offset = threadOffset;
+    listThreads({
+      accountId: selectedAccount || undefined,
+      folder: selectedFolder || undefined,
+      limit: THREAD_PAGE_SIZE,
+      offset,
+    })
+      .then((fetched) => {
+        setThreads((prev) => [...prev, ...fetched]);
+        setThreadOffset((prev) => prev + fetched.length);
+        setHasMoreThreads(fetched.length === THREAD_PAGE_SIZE);
+      })
+      .catch(console.error)
+      .finally(() => setLoadingMore(false));
+  }, [loadingMore, hasMoreThreads, threadOffset, selectedAccount, selectedFolder]);
 
   useEffect(() => {
     loadThreads();
   }, [loadThreads]);
 
   useEffect(() => {
+    if (selectedAccount) {
+      listFolders(selectedAccount)
+        .then(setFolders)
+        .catch(console.error);
+    } else {
+      setFolders([]);
+    }
+    setSelectedFolder(null);
+  }, [selectedAccount]);
+
+  useEffect(() => {
     let unlisten: UnlistenFn | undefined;
+    let alive = true;
     onMailSynced((event) => {
       if (event.new_count > 0) {
         loadThreads();
         setStatusMessage(`${event.new_count} new email${event.new_count === 1 ? "" : "s"}`);
       }
     }).then((fn) => {
+      if (!alive) {
+        fn();
+        return;
+      }
       unlisten = fn;
     });
     return () => {
+      alive = false;
       unlisten?.();
     };
   }, [loadThreads]);
@@ -478,8 +523,10 @@ export default function InboxPage() {
 
   useEffect(() => {
     let cancelled = false;
+    let unlistenStream: (() => void) | null = null;
+    let unlistenError: (() => void) | null = null;
     (async () => {
-      const [unlistenStream, unlistenError] = await Promise.all([
+      const [s, e] = await Promise.all([
         onAiStream((event) => {
           if (event.streamId !== activeStreamIdRef.current) return;
           const kind = activeStreamKindRef.current;
@@ -517,13 +564,17 @@ export default function InboxPage() {
         }),
       ]);
       if (cancelled) {
-        unlistenStream();
-        unlistenError();
+        s();
+        e();
         return;
       }
+      unlistenStream = s;
+      unlistenError = e;
     })();
     return () => {
       cancelled = true;
+      unlistenStream?.();
+      unlistenError?.();
     };
   }, [resetAiStream]);
 
@@ -604,12 +655,13 @@ export default function InboxPage() {
 
         for (const email of list) {
           if (!email.body_html && !email.body_text) {
-            fetchEmailBody(email.id)
+            fetchThreadBodies(thread.id)
               .then(async () => {
                 const refreshed = await getEmails(thread.id);
                 setEmails(refreshed);
               })
               .catch((e) => setStatusMessage(String(e)));
+            break;
           }
         }
       }
@@ -626,6 +678,7 @@ export default function InboxPage() {
     subject: string;
     bodyHtml: string;
     bodyText: string;
+    attachments?: AttachmentPayload[];
     inReplyTo?: string;
     references?: string[];
   }) => {
@@ -717,7 +770,79 @@ export default function InboxPage() {
     setInlineReplyReferences(
       [...(email.references || []), email.message_id].filter(Boolean),
     );
+    setInlineReplyQuoteHtml(buildReplyQuoteBody(email));
     setShowInlineReply(true);
+  }, []);
+
+  const selfAddress = useCallback(
+    (email: Email): string => {
+      const acct = accounts.find((a) => a.id === email.account_id);
+      return (acct?.email_address || "").toLowerCase();
+    },
+    [accounts],
+  );
+
+  const openReplyAllComposer = useCallback(
+    (email: Email) => {
+      const self = selfAddress(email);
+      const fromAddrs = email.from.map((a) => a.address);
+      const toAddrs = email.to.map((a) => a.address);
+      const recipients = [...fromAddrs, ...toAddrs]
+        .filter((addr) => addr.toLowerCase() !== self)
+        .filter((addr, idx, arr) => arr.indexOf(addr) === idx);
+      const replyCc = (email.cc || [])
+        .map((a) => a.address)
+        .filter((addr) => addr.toLowerCase() !== self)
+        .filter((addr, idx, arr) => arr.indexOf(addr) === idx)
+        .join(", ");
+      const replySubject = email.subject
+        ? email.subject.startsWith("Re:") || email.subject.startsWith("re:")
+          ? email.subject
+          : `Re: ${email.subject}`
+        : "";
+      setInlineReplyTo(recipients.join(", "));
+      setInlineReplyCc(replyCc);
+      setInlineReplySubject(replySubject);
+      setInlineReplyInReplyTo(email.message_id);
+      setInlineReplyReferences(
+        [...(email.references || []), email.message_id].filter(Boolean),
+      );
+      setInlineReplyQuoteHtml(buildReplyQuoteBody(email));
+      setShowInlineReply(true);
+    },
+    [selfAddress],
+  );
+
+  const openForwardComposer = useCallback(
+    (email: Email) => {
+      const fwdSubject = email.subject
+        ? email.subject.startsWith("Fwd:") || email.subject.startsWith("fwd:")
+          ? email.subject
+          : `Fwd: ${email.subject}`
+        : "";
+      setComposeTo("");
+      setComposeCc("");
+      setComposeSubject(fwdSubject);
+      setComposeBodyHtml(buildForwardBody(email));
+      setComposeInReplyTo(undefined);
+      setComposeReferences(undefined);
+      setAiDraftBody(null);
+      setShowInlineReply(false);
+      setComposing(true);
+    },
+    [],
+  );
+
+  const openNewComposer = useCallback(() => {
+    setComposeTo("");
+    setComposeCc("");
+    setComposeSubject("");
+    setComposeBodyHtml(undefined);
+    setComposeInReplyTo(undefined);
+    setComposeReferences(undefined);
+    setAiDraftBody(null);
+    setShowInlineReply(false);
+    setComposing(true);
   }, []);
 
   const handleSummarize = async () => {
@@ -877,6 +1002,42 @@ export default function InboxPage() {
     (e: React.MouseEvent, email: Email) => {
       ctxMenu.show(e, [
         {
+          label: "Reply",
+          icon: <Reply className="h-3.5 w-3.5" />,
+          onClick: () => {
+            setEmails((prev) => prev.map((em) => em.id === email.id ? { ...em } : em));
+            setSelectedEmail(email.id);
+            const replyTo = email.from.map((a) => a.address).join(", ");
+            const replyCc = email.cc?.map((a) => a.address).join(", ") || "";
+            const replySubject = email.subject
+              ? email.subject.startsWith("Re:") || email.subject.startsWith("re:")
+                ? email.subject
+                : `Re: ${email.subject}`
+              : "";
+            setReplyEditorKey(`manual-${Date.now()}`);
+            setInlineReplyTo(replyTo);
+            setInlineReplyCc(replyCc);
+            setInlineReplySubject(replySubject);
+            setInlineReplyInReplyTo(email.message_id);
+            setInlineReplyReferences(
+              [...(email.references || []), email.message_id].filter(Boolean),
+            );
+            setInlineReplyQuoteHtml(buildReplyQuoteBody(email));
+            setShowInlineReply(true);
+          },
+        },
+        {
+          label: "Reply All",
+          icon: <ReplyAll className="h-3.5 w-3.5" />,
+          onClick: () => openReplyAllComposer(email),
+        },
+        {
+          label: "Forward",
+          icon: <Forward className="h-3.5 w-3.5" />,
+          onClick: () => openForwardComposer(email),
+        },
+        { separator: true },
+        {
           label: "Chat about this email",
           icon: <MessageSquare className="h-3.5 w-3.5" />,
           disabled: !aiConfig || !online,
@@ -904,14 +1065,32 @@ export default function InboxPage() {
         },
       ]);
     },
-    [ctxMenu, aiConfig, online, handleChatAbout, handleArchive, handleDelete],
+    [ctxMenu, aiConfig, online, handleChatAbout, handleArchive, handleDelete, openReplyAllComposer, openForwardComposer],
   );
+
+  kbStateRef.current = {
+    threads, selectedThread, selectedEmailData, composing, showInlineReply,
+    aiDraftLoading, aiSummaryLoading, aiConfig, handleManualReply, openNewComposer,
+    handleSelectThread, handleSummarize, handleArchive, handleDelete,
+  };
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
       if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) return;
-      if (composing || showInlineReply || aiDraftLoading || aiSummaryLoading) return;
+      const s = kbStateRef.current;
+      if (s.composing || s.showInlineReply || s.aiDraftLoading || s.aiSummaryLoading) return;
+
+      const threads = s.threads as Thread[];
+      const selectedThread = s.selectedThread as number | null;
+      const selectedEmailData = s.selectedEmailData as Email | null;
+      const aiConfig = s.aiConfig as unknown;
+      const handleSelectThread = s.handleSelectThread as (t: Thread) => void;
+      const handleManualReply = s.handleManualReply as () => void;
+      const openNewComposer = s.openNewComposer as () => void;
+      const handleSummarize = s.handleSummarize as () => void;
+      const handleArchive = s.handleArchive as (id: number) => void;
+      const handleDelete = s.handleDelete as (id: number) => void;
 
       if (e.key === "j" || e.key === "ArrowDown") {
         e.preventDefault();
@@ -928,7 +1107,7 @@ export default function InboxPage() {
         handleManualReply();
       } else if ((e.metaKey || e.ctrlKey) && e.key === "n") {
         e.preventDefault();
-        setComposing(true);
+        openNewComposer();
       } else if (e.key === "s" && selectedThread && aiConfig) {
         e.preventDefault();
         handleSummarize();
@@ -945,7 +1124,7 @@ export default function InboxPage() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [threads, selectedThread, selectedEmailData, composing, showInlineReply, aiDraftLoading, aiSummaryLoading, aiConfig]);
+  }, []);
 
   return (
     <div className="flex h-full">
@@ -1024,15 +1203,51 @@ export default function InboxPage() {
               <button
                 key={account.id}
                 onClick={() => setSelectedAccount(account.id)}
-                className={`px-2 py-0.5 text-[11px] rounded-md whitespace-nowrap transition-colors ${
+                title={account.sync_error ?? undefined}
+                className={`flex items-center gap-1 px-2 py-0.5 text-[11px] rounded-md whitespace-nowrap transition-colors ${
                   selectedAccount === account.id
                     ? "bg-foreground text-background"
                     : "text-muted-foreground hover:bg-accent"
                 }`}
               >
+                {account.sync_error && (
+                  <span
+                    title={account.sync_error}
+                    className="h-1.5 w-1.5 rounded-full bg-red-500 shrink-0"
+                  />
+                )}
                 {account.email_address !== "unknown@unknown.com"
                   ? account.email_address
                   : account.display_name}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Folder filter */}
+        {folders.length > 1 && (
+          <div className="flex gap-1 px-2 py-1.5 border-b border-border overflow-x-auto scrollbar-none">
+            <button
+              onClick={() => setSelectedFolder(null)}
+              className={`px-2 py-0.5 text-[11px] rounded-md whitespace-nowrap transition-colors ${
+                selectedFolder === null
+                  ? "bg-foreground text-background"
+                  : "text-muted-foreground hover:bg-accent"
+              }`}
+            >
+              All
+            </button>
+            {folders.map((folder) => (
+              <button
+                key={folder.id}
+                onClick={() => setSelectedFolder(folder.imap_name)}
+                className={`px-2 py-0.5 text-[11px] rounded-md whitespace-nowrap transition-colors ${
+                  selectedFolder === folder.imap_name
+                    ? "bg-foreground text-background"
+                    : "text-muted-foreground hover:bg-accent"
+                }`}
+              >
+                {folder.name}
               </button>
             ))}
           </div>
@@ -1098,64 +1313,16 @@ export default function InboxPage() {
               <p className="text-xs text-muted-foreground/70 mt-1">Sync to fetch emails</p>
             </div>
           ) : (
-            (() => {
-              let currentGroup = "";
-              return threads.map((thread) => {
-                const group = dateGroup(thread.latest_date);
-                const showHeader = group !== currentGroup;
-                currentGroup = group;
-                const selected = selectedThread === thread.id;
-                const threadBusy = busyThreadIds.has(thread.id);
-                return (
-                  <div key={thread.id}>
-                    {showHeader && (
-                      <div className="px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/60">
-                        {group}
-                      </div>
-                    )}
-                    <div
-                      onClick={() => !threadBusy && handleSelectThread(thread)}
-                      onContextMenu={(e) => handleThreadContextMenu(e, thread)}
-                      className={`relative flex items-start gap-2.5 px-3 py-2.5 cursor-pointer transition-colors group ${
-                        threadBusy ? "opacity-50 pointer-events-none" : ""
-                      } ${selected
-                          ? "bg-accent"
-                          : "hover:bg-accent/50"
-                      }`}
-                    >
-                      {selected && (
-                        <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-foreground" />
-                      )}
-                      {threadBusy && (
-                        <div className="absolute right-2 top-2.5">
-                          <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
-                        </div>
-                      )}
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-1.5">
-                          {!thread.is_read && (
-                            <span className="h-1.5 w-1.5 rounded-full bg-ai shrink-0" />
-                          )}
-                          <ThreadLabels thread={thread} />
-                          <p className={`text-sm truncate flex-1 ${!thread.is_read ? "font-semibold" : "text-muted-foreground"}`}>
-                            {thread.subject || "(no subject)"}
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-1.5 mt-0.5">
-                          <p className="text-[11px] text-muted-foreground/80">
-                            {thread.message_count} {thread.message_count === 1 ? "msg" : "msgs"}
-                          </p>
-                          <span className="text-[11px] text-muted-foreground/40">·</span>
-                          <p className="text-[11px] text-muted-foreground/80">
-                            {formatDate(thread.latest_date)}
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                );
-              });
-            })()
+            <VirtualizedThreadList
+              threads={threads}
+              selectedThreadId={selectedThread}
+              busyThreadIds={busyThreadIds}
+              onSelectThread={handleSelectThread}
+              onContextMenu={handleThreadContextMenu}
+              hasMore={hasMoreThreads}
+              onLoadMore={loadMoreThreads}
+              loadingMore={loadingMore}
+            />
           )}
         </div>
       </div>
@@ -1166,17 +1333,20 @@ export default function InboxPage() {
         {composing ? (
           <ComposeEditor
             accountId={selectedAccount || accounts[0]?.id || 0}
-            to=""
-            cc=""
+            to={composeTo}
+            cc={composeCc}
             bcc=""
-            subject=""
-            initialBodyHtml={aiDraftBody || undefined}
+            subject={composeSubject}
+            initialBodyHtml={composeBodyHtml ?? aiDraftBody ?? undefined}
+            inReplyTo={composeInReplyTo}
+            references={composeReferences}
             aiEnabled={!!aiConfig && online}
             aiTone={aiTone}
             onSend={handleSend}
             onCancel={() => {
               setComposing(false);
               setAiDraftBody(null);
+              setComposeBodyHtml(undefined);
             }}
             sending={sending}
           />
@@ -1242,21 +1412,43 @@ export default function InboxPage() {
                 </Button>
               )}
               {online && lastEmail && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={handleManualReply}
-                  disabled={aiSummaryLoading || aiDraftLoading}
-                  className="h-8 text-xs gap-1.5"
-                >
-                  <Reply className="h-3.5 w-3.5" strokeWidth={1.75} />
-                  Reply
-                </Button>
+                <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={handleManualReply}
+                    disabled={aiSummaryLoading || aiDraftLoading}
+                    className="h-8 text-xs gap-1.5"
+                  >
+                    <Reply className="h-3.5 w-3.5" strokeWidth={1.75} />
+                    Reply
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => openReplyAllComposer(lastEmail)}
+                    disabled={aiSummaryLoading || aiDraftLoading}
+                    className="h-8 text-xs gap-1.5"
+                    title="Reply to all recipients"
+                  >
+                    <ReplyAll className="h-3.5 w-3.5" strokeWidth={1.75} />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => openForwardComposer(lastEmail)}
+                    disabled={aiSummaryLoading || aiDraftLoading}
+                    className="h-8 text-xs gap-1.5"
+                    title="Forward"
+                  >
+                    <Forward className="h-3.5 w-3.5" strokeWidth={1.75} />
+                  </Button>
+                </>
               )}
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => setComposing(true)}
+                onClick={openNewComposer}
                 className="h-8 text-xs gap-1.5"
               >
                 <PenSquare className="h-3.5 w-3.5" strokeWidth={1.75} />
@@ -1332,7 +1524,7 @@ export default function InboxPage() {
                       initialBodyHtml={
                         !aiDraftLoading && aiReplyBody
                           ? plainTextToHtml(aiReplyBody)
-                          : undefined
+                          : inlineReplyQuoteHtml
                       }
                       streamingBody={aiDraftLoading ? aiReplyBody : undefined}
                       bodyKey={replyEditorKey}
@@ -1399,7 +1591,7 @@ export default function InboxPage() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setComposing(true)}
+                onClick={openNewComposer}
                 className="mt-2 text-xs gap-1.5"
               >
                 <PenSquare className="h-3.5 w-3.5" />

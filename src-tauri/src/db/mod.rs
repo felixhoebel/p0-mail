@@ -23,6 +23,9 @@ fn generate_hex_key() -> String {
 }
 
 fn get_or_create_db_key() -> Result<String, String> {
+    if let Ok(key) = std::env::var("P0MAIL_DB_KEY") {
+        return Ok(key);
+    }
     match crate::secure::get_db_key() {
         Ok(key) if !key.is_empty() => Ok(key),
         _ => {
@@ -149,6 +152,31 @@ fn run_migrations(conn: &Connection) -> SqlResult<()> {
             "fts_body_index",
             include_str!("../../migrations/006_fts_body_index.sql"),
         ),
+        (
+            7,
+            "attachments_data",
+            include_str!("../../migrations/007_attachments_data.sql"),
+        ),
+        (
+            8,
+            "folders",
+            include_str!("../../migrations/008_folders.sql"),
+        ),
+        (
+            9,
+            "drafts",
+            include_str!("../../migrations/009_drafts.sql"),
+        ),
+        (
+            10,
+            "sync_health",
+            include_str!("../../migrations/010_sync_health.sql"),
+        ),
+        (
+            11,
+            "fts_conditional_triggers",
+            include_str!("../../migrations/011_fts_conditional_triggers.sql"),
+        ),
     ];
 
     for (id, name, sql) in migrations {
@@ -195,7 +223,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 6);
+        assert_eq!(count, 11);
     }
 
     #[test]
@@ -212,6 +240,41 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert!(cols.iter().any(|c| c == "sync_enabled"), "sync_enabled column missing: {:?}", cols);
+    }
+
+    #[test]
+    fn migration_008_creates_folders_tables() {
+        let path = temp_path("p0mail_mig8.db");
+        let conn = open_with_key(&path, &"00".repeat(32)).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run_migrations(&conn).unwrap();
+
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(tables.iter().any(|t| t == "folders"), "folders table missing");
+        assert!(tables.iter().any(|t| t == "folder_sync_state"), "folder_sync_state table missing");
+    }
+
+    #[test]
+    fn migration_007_009_add_send_queue_columns() {
+        let path = temp_path("p0mail_mig7_9.db");
+        let conn = open_with_key(&path, &"00".repeat(32)).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run_migrations(&conn).unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(send_queue)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(cols.iter().any(|c| c == "attachments_data"), "attachments_data column missing");
+        assert!(cols.iter().any(|c| c == "updated_at"), "updated_at column missing");
     }
 
     #[test]

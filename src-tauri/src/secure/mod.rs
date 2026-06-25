@@ -21,7 +21,20 @@ fn cache_remove(key: &str) {
 
 pub fn store_secret(key: &str, value: &str) -> Result<(), String> {
     let entry = Entry::new(SERVICE_NAME, key).map_err(|e| e.to_string())?;
-    entry.set_password(value).map_err(|e| e.to_string())?;
+    match entry.set_password(value) {
+        Ok(()) => {}
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("already exists") || err_str.contains("duplicate") {
+                let _ = entry.delete_credential();
+                entry
+                    .set_password(value)
+                    .map_err(|e| format!("Failed to store secret after retry: {e}"))?;
+            } else {
+                return Err(err_str);
+            }
+        }
+    }
     cache_insert(key, value);
     Ok(())
 }
