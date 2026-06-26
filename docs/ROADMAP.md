@@ -2,7 +2,7 @@
 
 > **Purpose.** Self-contained workstream specs for autonomous agents. Each task lists what to build, which files to touch, dependencies, and how to verify. Pick a phase → pick a task → execute end-to-end.
 
-**Current state:** Phase 1-3 complete (DB encrypted at rest, background polling, new-mail notifications, FTS5 search, CI signing, OAuth + IMAP + AI streaming, attachments, folders, drafts, reply-all/forward, virtualization, error boundary, sync health). Phase 4 in progress: 4.1 Command palette ✅, 4.9 AI summary workflow ✅; remaining (undo send, snooze, schedule, autocomplete, bundles, per-account settings, live theme). Phase 5 (code-quality refactors: lib.rs/InboxPage god-modules) partially done (5.1-5.3 ✅; 5.4-5.6 pending). An audit found a few latent bugs in "complete" tasks (see 5.2 FTS bug ✅fixed, mark_read swallows IMAP errors, handleArchive/handleDelete swallow backend errors) — these are tracked in Phase 5.
+**Current state:** Phase 1-3 complete (DB encrypted at rest, background polling, new-mail notifications, FTS5 search, CI signing, OAuth + IMAP + AI streaming, attachments, folders, drafts, reply-all/forward, virtualization, error boundary, sync health). Phase 4 in progress: 4.1 Command palette ✅, 4.9 AI summary workflow ✅, 4.2 Undo send ✅; remaining (snooze, schedule, autocomplete, bundles, per-account settings, live theme). Phase 5 (code-quality refactors: lib.rs/InboxPage god-modules) partially done (5.1-5.3 ✅; 5.4-5.6 pending). An audit found a few latent bugs in "complete" tasks (see 5.2 FTS bug ✅fixed, mark_read swallows IMAP errors, handleArchive/handleDelete swallow backend errors) — these are tracked in Phase 5.
 
 **Conventions:** Conventional commits (`feat:`, `fix:`, `security:`, `chore:`). No comments unless asked. Rust in `src-tauri/src/`, React in `src/`. Verify with `cargo test` + `npm run build` (CI runs `tsc --noEmit` + build).
 
@@ -254,10 +254,19 @@ Driven by an architecture audit of the two largest files (`lib.rs` 1957 LOC, `In
 **Depends on:** 2.5 (virtualized list helps scale search).
 **Status:** ✅ COMPLETE — palette renders globally via `InboxPage` (always-mounted) + portal; fuzzy matcher in `src/lib/fuzzy.ts`; thread search reuses `search_emails` FTS (matches subject/from/to/body); actions wired (compose/sync/settings/mark-all-read/archive-selected); added backend `mark_all_read` command for bulk local read-state.
 
-### 4.2 Undo send (5–10s grace window)
+### 4.2 Undo send (5–10s grace window) ✅ COMPLETE
 **Spec:** On send, hold in `send_queue` with `status = 'sending'` + `send_after = now + 8s`. Show a toast "Sent — Undo" for 8s. If undone, move to drafts. Otherwise process queue.
-**Files:** `src-tauri/src/compose/mod.rs`, `src-tauri/src/lib.rs`, `src/pages/InboxPage.tsx` (toast).
-**Depends on:** 2.3 (drafts).
+**Implementation:**
+- Migration `013_undo_send.sql` recreates `send_queue` with a relaxed status CHECK (`pending`,`sending`,`sent`,`failed`,`draft`) — also fixes a latent bug where the Phase-2.3 `save_draft` path inserted `status='draft'` in violation of the original `001` CHECK. Adds `send_after`, `in_reply_to`, `references` columns + indexes.
+- `ComposeService::queue_email` now takes `defer_seconds: Option<i64>` and returns the queue id; `Some(n)` → `status='sending'` + `send_after = now + n`, `None` → `status='pending'` (existing offline path).
+- `ComposeService::process_queue` picks up both `pending` and due `sending` items (`send_after IS NULL OR send_after <= now`).
+- `process_queue_item` now persists + replays `in_reply_to`/`references` (previously dropped by `queue_email`), and on success inserts the local Sent copy + rebuilds threads (previously skipped for queued/offline sends).
+- New `cancel_send(queue_id)` Tauri command flips a `sending` item to `draft`.
+- Poll loop calls `process_queue()` each cycle as a backstop so deferred sends fire even if the frontend is closed.
+- Frontend (`InboxPage`): online send queues with `deferSeconds: 8`, closes the composer, and shows a fixed bottom toast "Sending … — Undo" for 8s. Undo → `cancelSend` (message saved to Drafts). Timer expiry → `processSendQueue`. Sending a second email commits any in-flight undo window first.
+**Files:** `src-tauri/migrations/013_undo_send.sql`, `src-tauri/src/db/mod.rs`, `src-tauri/src/compose/mod.rs`, `src-tauri/src/lib.rs`, `src/lib/api.ts`, `src/pages/InboxPage.tsx`.
+**Verify:** `cargo test` (20 passed, incl. new `migration_013_allows_draft_and_sending_status_and_adds_send_after`) + `cargo clippy` clean + `npm run build`/`tsc` clean. Manual: send an email → toast appears → click Undo within 8s → message lands in Drafts; otherwise it sends and appears in Sent.
+**Depends on:** 2.3 (drafts). **Unblocks:** 4.3 (same queue + `send_after` infra).
 
 ### 4.3 Schedule send
 **Spec:** Compose has "Send later" → datetime picker. Queue with `send_after = <ts>`. Background poller (1min) sends when due.
@@ -311,7 +320,7 @@ Four actions on the summary panel, shown as a button row beneath the summary tex
 
 ```
 1.3 SQLCipher ─┬─► 1.1 Poll loop ─┬─► 1.2 Notifications ✅
-               │                  ├─► 2.2 Folders ─► 2.3 Drafts ─► 4.2 Undo send ─► 4.3 Schedule
+               │                  ├─► 2.2 Folders ─► 2.3 Drafts ─► 4.2 Undo send ✅ ─► 4.3 Schedule
                │                  └─► 4.4 Snooze/reminders
 1.4 FTS fix ─────────────────────► ✅ (independent)
 1.5 CI signing ───────────────────► ✅ (parallel infra)
@@ -353,7 +362,7 @@ When picking up a task:
 - [x] 3.4 IMAP validation leak
 - [x] 3.5 Input validation
 - [x] 4.1 Command palette
-- [ ] 4.2 Undo send
+- [x] 4.2 Undo send
 - [ ] 4.3 Schedule send
 - [ ] 4.4 Snooze/reminders
 - [ ] 4.5 Autocomplete

@@ -190,6 +190,11 @@ fn run_migrations(conn: &Connection) -> SqlResult<()> {
             "fts_html_stripped",
             include_str!("../../migrations/012_fts_html_stripped.sql"),
         ),
+        (
+            13,
+            "undo_send",
+            include_str!("../../migrations/013_undo_send.sql"),
+        ),
     ];
 
     for (id, name, sql) in migrations {
@@ -237,7 +242,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 12);
+        assert_eq!(count, 13);
     }
 
     #[test]
@@ -334,6 +339,50 @@ mod tests {
     }
 
     #[test]
+    fn migration_013_allows_draft_and_sending_status_and_adds_send_after() {
+        let path = temp_path("p0mail_mig13.db");
+        let conn = open_with_key(&path, &"00".repeat(32)).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        register_sql_functions(&conn).unwrap();
+        run_migrations(&conn).unwrap();
+
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(send_queue)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(cols.iter().any(|c| c == "send_after"), "send_after column missing: {:?}", cols);
+        assert!(cols.iter().any(|c| c == "in_reply_to"), "in_reply_to column missing: {:?}", cols);
+        assert!(cols.iter().any(|c| c == "references"), "references column missing: {:?}", cols);
+
+        conn.execute(
+            "INSERT INTO accounts (provider_type, display_name, email_address, last_seen_uid) \
+             VALUES ('imap','t','a@b.com',0)",
+            [],
+        )
+        .unwrap();
+        let account_id = conn.last_insert_rowid();
+
+        for status in ["draft", "sending", "pending", "sent", "failed"] {
+            conn.execute(
+                "INSERT INTO send_queue (account_id, to_json, subject, status) \
+                 VALUES (?1, 'x', 's', ?2)",
+                params![account_id, status],
+            )
+            .unwrap_or_else(|e| panic!("status '{}' should be allowed: {}", status, e));
+        }
+
+        let bad = conn.execute(
+            "INSERT INTO send_queue (account_id, to_json, subject, status) \
+             VALUES (?1, 'x', 's', 'bogus')",
+            params![account_id],
+        );
+        assert!(bad.is_err(), "unknown status should be rejected by CHECK");
+    }
+
+    #[test]
     fn fresh_db_is_encrypted_with_key() {
         let path = temp_path("p0mail_fresh_enc.db");
         let key = "ab".repeat(32);
@@ -387,3 +436,4 @@ mod tests {
         assert!(r.is_err(), "wrong key should not decrypt the DB");
     }
 }
+

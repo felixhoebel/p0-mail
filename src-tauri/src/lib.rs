@@ -85,6 +85,10 @@ async fn run_poll_loop(app: tauri::AppHandle, wake: Arc<tokio::sync::Notify>) {
                 backoff = true;
             }
         }
+
+        if let Err(e) = compose::ComposeService::new().process_queue().await {
+            log::warn!("Background send queue processing failed: {}", e);
+        }
     }
 }
 
@@ -1015,7 +1019,7 @@ async fn send_email(
     Ok(())
 }
 
-fn insert_sent_copy(
+pub fn insert_sent_copy(
     account_id: i64,
     to: &str,
     cc: Option<&str>,
@@ -1315,11 +1319,12 @@ fn map_email_row(row: &rusqlite::Row) -> rusqlite::Result<models::Email> {
 
 #[tauri::command]
 async fn retry_send_queue_item(queue_id: i64) -> Result<(), String> {
-    let item: (i64, i64, String, Option<String>, Option<String>, String, Option<String>, Option<String>, i64, Option<Vec<u8>>) = {
+    let item: (i64, i64, String, Option<String>, Option<String>, String, Option<String>, Option<String>, i64, Option<Vec<u8>>, Option<String>, Option<String>) = {
         let conn = db::get()?;
         conn.query_row(
             "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
-             body_html, body_text, retry_count, attachments_data \
+             body_html, body_text, retry_count, attachments_data, \
+             in_reply_to, \"references\" \
              FROM send_queue WHERE id = ?1",
             rusqlite::params![queue_id],
             |row| {
@@ -1334,6 +1339,8 @@ async fn retry_send_queue_item(queue_id: i64) -> Result<(), String> {
                     row.get(7)?,
                     row.get(8)?,
                     row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
                 ))
             },
         )
@@ -1342,6 +1349,7 @@ async fn retry_send_queue_item(queue_id: i64) -> Result<(), String> {
     let service = compose::ComposeService::new();
     service.process_queue_item(
         item.0, item.1, item.2, item.3, item.4, item.5, item.6, item.7, item.8, item.9,
+        item.10, item.11,
     ).await
 }
 
@@ -1924,7 +1932,8 @@ async fn queue_email(
     attachments: Option<Vec<models::AttachmentPayload>>,
     in_reply_to: Option<String>,
     references: Option<Vec<String>>,
-) -> Result<(), String> {
+    defer_seconds: Option<i64>,
+) -> Result<i64, String> {
     let service = compose::ComposeService::new();
     service
         .queue_email(
@@ -1937,7 +1946,8 @@ async fn queue_email(
             &body_text,
             attachments,
             in_reply_to.as_deref(),
-            references,
+            references.as_deref(),
+            defer_seconds,
         )
         .await
 }
@@ -1946,6 +1956,22 @@ async fn queue_email(
 async fn process_send_queue() -> Result<(), String> {
     let service = compose::ComposeService::new();
     service.process_queue().await
+}
+
+#[tauri::command]
+async fn cancel_send(queue_id: i64) -> Result<bool, String> {
+    run_db(move || {
+        let conn = db::get()?;
+        let updated = conn
+            .execute(
+                "UPDATE send_queue SET status = 'draft', updated_at = ?1 \
+                 WHERE id = ?2 AND status = 'sending'",
+                rusqlite::params![chrono::Utc::now().timestamp(), queue_id],
+            )
+            .map_err(|e| format!("Failed to cancel send: {}", e))?;
+        Ok(updated > 0)
+    })
+    .await
 }
 
 fn show_fatal_error(msg: &str) {
@@ -2034,6 +2060,7 @@ pub fn run() {
             fetch_recent_bodies,
             queue_email,
             process_send_queue,
+            cancel_send,
             get_send_queue,
             retry_send_queue_item,
             save_draft,

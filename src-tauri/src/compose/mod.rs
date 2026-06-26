@@ -2,8 +2,24 @@ use crate::commands::models::AttachmentPayload;
 use crate::db;
 use crate::oauth::{ensure_oauth_email, OAuthProvider};
 use crate::smtp_client::SmtpConnection;
+use crate::threading::ThreadingService;
 
 const MAX_ATTACHMENT_TOTAL_BYTES: usize = 25 * 1024 * 1024;
+
+struct QueueRow {
+    id: i64,
+    account_id: i64,
+    to: String,
+    cc: Option<String>,
+    bcc: Option<String>,
+    subject: String,
+    body_html: Option<String>,
+    body_text: Option<String>,
+    retry_count: i64,
+    attachments_data: Option<Vec<u8>>,
+    in_reply_to: Option<String>,
+    references_json: Option<String>,
+}
 
 pub struct ComposeService;
 
@@ -111,9 +127,10 @@ impl ComposeService {
         body_html: &str,
         body_text: &str,
         attachments: Option<Vec<AttachmentPayload>>,
-        _in_reply_to: Option<&str>,
-        _references: Option<Vec<String>>,
-    ) -> Result<(), String> {
+        in_reply_to: Option<&str>,
+        references: Option<&[String]>,
+        defer_seconds: Option<i64>,
+    ) -> Result<i64, String> {
         let (attachments_json, attachments_blob) = match &attachments {
             Some(atts) if !atts.is_empty() => {
                 let metas: Vec<serde_json::Value> = atts
@@ -133,11 +150,20 @@ impl ComposeService {
             _ => (None, None),
         };
 
+        let now = chrono::Utc::now().timestamp();
+        let (status, send_after) = match defer_seconds {
+            Some(secs) if secs > 0 => ("sending", Some(now + secs)),
+            _ => ("pending", None),
+        };
+        let refs_json = references.map(|r| serde_json::to_string(r).unwrap_or_else(|_| "[]".to_string()));
+
         let conn = db::get()?;
         conn.execute(
             "INSERT INTO send_queue \
-             (account_id, to_json, cc_json, bcc_json, subject, body_html, body_text, attachments_meta, attachments_data, status) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')",
+             (account_id, to_json, cc_json, bcc_json, subject, body_html, body_text, \
+              attachments_meta, attachments_data, in_reply_to, \"references\", status, \
+              send_after, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
             rusqlite::params![
                 account_id,
                 to,
@@ -148,51 +174,79 @@ impl ComposeService {
                 body_text,
                 attachments_json,
                 attachments_blob,
+                in_reply_to,
+                refs_json,
+                status,
+                send_after,
+                now,
             ],
         )
         .map_err(|e| format!("Failed to queue email: {}", e))?;
-        Ok(())
+        Ok(conn.last_insert_rowid())
     }
 
     pub async fn process_queue(&self) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp();
-        let items: Vec<(i64, i64, String, Option<String>, Option<String>, String, Option<String>, Option<String>, i64, Option<Vec<u8>>)> = {
+        let items: Vec<QueueRow> = {
             let conn = db::get()?;
             let mut stmt = conn
                 .prepare(
                     "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
-                     body_html, body_text, retry_count, attachments_data \
-                     FROM send_queue WHERE status = 'pending' AND retry_count < 5 \
-                     AND (next_retry_at IS NULL OR next_retry_at <= ?1)",
+                     body_html, body_text, retry_count, attachments_data, \
+                     in_reply_to, \"references\" \
+                     FROM send_queue WHERE status IN ('pending','sending') AND retry_count < 5 \
+                     AND (next_retry_at IS NULL OR next_retry_at <= ?1) \
+                     AND (send_after IS NULL OR send_after <= ?1) \
+                     ORDER BY send_after IS NOT NULL, id",
                 )
                 .map_err(|e| e.to_string())?;
 
             let rows: Vec<_> = stmt
                 .query_map(rusqlite::params![now], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                    ))
+                    Ok(QueueRow {
+                        id: row.get(0)?,
+                        account_id: row.get(1)?,
+                        to: row.get(2)?,
+                        cc: row.get(3)?,
+                        bcc: row.get(4)?,
+                        subject: row.get(5)?,
+                        body_html: row.get(6)?,
+                        body_text: row.get(7)?,
+                        retry_count: row.get(8)?,
+                        attachments_data: row.get(9)?,
+                        in_reply_to: row.get(10)?,
+                        references_json: row.get(11)?,
+                    })
                 })
                 .map_err(|e| e.to_string())?
-                .filter_map(|r| r.ok())
+                .filter_map(|r| r.map_err(|e| log::warn!("queue row map: {e}")).ok())
                 .collect();
             rows
         };
 
-        for (id, account_id, to, cc, bcc, subject, body_html, body_text, retry_count, attachments_data) in items {
-            self.process_queue_item(id, account_id, to, cc, bcc, subject, body_html, body_text, retry_count, attachments_data).await?;
+        for row in items {
+            self.process_queue_row(&row).await?;
         }
 
         Ok(())
+    }
+
+    async fn process_queue_row(&self, row: &QueueRow) -> Result<(), String> {
+        self.process_queue_item(
+            row.id,
+            row.account_id,
+            row.to.clone(),
+            row.cc.clone(),
+            row.bcc.clone(),
+            row.subject.clone(),
+            row.body_html.clone(),
+            row.body_text.clone(),
+            row.retry_count,
+            row.attachments_data.clone(),
+            row.in_reply_to.clone(),
+            row.references_json.clone(),
+        )
+        .await
     }
 
     pub async fn process_queue_item(
@@ -207,10 +261,16 @@ impl ComposeService {
         body_text: Option<String>,
         retry_count: i64,
         attachments_data: Option<Vec<u8>>,
+        in_reply_to: Option<String>,
+        references_json: Option<String>,
     ) -> Result<(), String> {
         let attachments: Option<Vec<AttachmentPayload>> = attachments_data
             .as_deref()
             .and_then(|blob| serde_json::from_slice(blob).ok());
+
+        let references: Option<Vec<String>> = references_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
 
         let result = self
             .send_email(
@@ -222,19 +282,48 @@ impl ComposeService {
                 body_html.as_deref().unwrap_or(""),
                 body_text.as_deref().unwrap_or(""),
                 attachments,
-                None,
-                None,
+                in_reply_to.as_deref(),
+                references.clone(),
             )
             .await;
 
         match result {
             Ok(()) => {
-                let conn = db::get()?;
-                conn.execute(
-                    "UPDATE send_queue SET status = 'sent', sent_at = strftime('%s','now') WHERE id = ?1",
-                    rusqlite::params![id],
-                )
-                .map_err(|e| e.to_string())?;
+                {
+                    let conn = db::get()?;
+                    conn.execute(
+                        "UPDATE send_queue SET status = 'sent', sent_at = strftime('%s','now') WHERE id = ?1",
+                        rusqlite::params![id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+
+                let to_for_sent = to.clone();
+                let cc_for_sent = cc.clone();
+                let bcc_for_sent = bcc.clone();
+                let subject_for_sent = subject.clone();
+                let body_html_for_sent = body_html.clone().unwrap_or_default();
+                let body_text_for_sent = body_text.clone().unwrap_or_default();
+                let in_reply_to_for_sent = in_reply_to.clone();
+                let refs_for_sent = references.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::insert_sent_copy(
+                        account_id,
+                        &to_for_sent,
+                        cc_for_sent.as_deref(),
+                        bcc_for_sent.as_deref(),
+                        &subject_for_sent,
+                        &body_html_for_sent,
+                        &body_text_for_sent,
+                        in_reply_to_for_sent.as_deref(),
+                        refs_for_sent.as_deref(),
+                    )
+                })
+                .await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    ThreadingService::new().rebuild_threads_for_account(account_id)
+                })
+                .await;
             }
             Err(e) => {
                 log::warn!("Send queue item {} failed: {}", id, e);

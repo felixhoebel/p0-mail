@@ -14,9 +14,9 @@ import {
   markAllRead,
   archiveEmail,
   deleteEmail,
-  sendEmail,
   queueEmail,
   processSendQueue,
+  cancelSend,
   getSendQueue,
   fetchEmailBody,
   fetchRecentBodies,
@@ -360,6 +360,8 @@ export default function InboxPage({ active }: { active: boolean }) {
   const [online, setOnline] = useState(true);
   const [pendingQueueCount, setPendingQueueCount] = useState(0);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [undoSend, setUndoSend] = useState<{ queueId: number; subject: string } | null>(null);
+  const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [aiConfig, setAiConfig] = useState<AiConfig | null>(null);
 
   const [aiSummary, setAiSummary] = useState<string | null>(null);
@@ -394,6 +396,8 @@ export default function InboxPage({ active }: { active: boolean }) {
 
   const searchInputRef = useRef<HTMLInputElement>(null);
   const ctxMenu = useContextMenu();
+
+  const UNDO_WINDOW_MS = 8000;
 
   const aiTone = (aiConfig?.default_tone || "Professional") as AiTone;
   const aiLanguage = aiConfig?.output_language || "en";
@@ -490,6 +494,12 @@ export default function InboxPage({ active }: { active: boolean }) {
   useEffect(() => {
     loadThreads();
   }, [loadThreads]);
+
+  useEffect(() => {
+    return () => {
+      if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (selectedAccount) {
@@ -700,6 +710,59 @@ export default function InboxPage({ active }: { active: boolean }) {
     }
   };
 
+  const closeComposeAfterSend = () => {
+    setShowInlineReply(false);
+    setComposing(false);
+    setAiReplyBody("");
+    setAiReplyThinking("");
+    setAiDraftBody(null);
+    setAiDraftLoading(false);
+    setAiDraftError(null);
+  };
+
+  const commitQueuedSend = useCallback(async (queueId: number, subject: string) => {
+    try {
+      await processSendQueue();
+      setStatusMessage(`"${subject || "(no subject)"}" sent.`);
+    } catch (e) {
+      setStatusMessage(String(e));
+    } finally {
+      setUndoSend((prev) => (prev && prev.queueId === queueId ? null : prev));
+    }
+  }, []);
+
+  const startUndoWindow = useCallback((queueId: number, subject: string) => {
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    setUndoSend({ queueId, subject });
+    setStatusMessage("Sending…");
+    undoTimerRef.current = setTimeout(() => {
+      undoTimerRef.current = null;
+      void commitQueuedSend(queueId, subject);
+    }, UNDO_WINDOW_MS);
+  }, [commitQueuedSend]);
+
+  const handleUndoSend = useCallback(async () => {
+    const current = undoSend;
+    if (!current) return;
+    const { queueId, subject } = current;
+    if (undoTimerRef.current) {
+      clearTimeout(undoTimerRef.current);
+      undoTimerRef.current = null;
+    }
+    try {
+      const canceled = await cancelSend(queueId);
+      if (canceled) {
+        setStatusMessage(`"${subject || "(no subject)"}" — send canceled, saved to Drafts.`);
+      } else {
+        setStatusMessage("Couldn't cancel — message already sending.");
+      }
+    } catch (e) {
+      setStatusMessage(String(e));
+    } finally {
+      setUndoSend(null);
+    }
+  }, [undoSend]);
+
   const handleSend = async (params: {
     accountId: number;
     to: string;
@@ -716,21 +779,24 @@ export default function InboxPage({ active }: { active: boolean }) {
     setStatusMessage(null);
     try {
       if (online) {
-        await sendEmail(params);
-        setStatusMessage("Email sent.");
+        if (undoSend) {
+          if (undoTimerRef.current) {
+            clearTimeout(undoTimerRef.current);
+            undoTimerRef.current = null;
+          }
+          await processSendQueue().catch(console.error);
+          setUndoSend(null);
+        }
+        const queueId = await queueEmail({ ...params, deferSeconds: UNDO_WINDOW_MS / 1000 });
+        closeComposeAfterSend();
+        startUndoWindow(queueId, params.subject);
       } else {
         await queueEmail(params);
         setStatusMessage("Offline — email queued for later.");
         const items = await getSendQueue();
         setPendingQueueCount(items.filter((i) => i.status === "pending").length);
+        closeComposeAfterSend();
       }
-      setShowInlineReply(false);
-      setComposing(false);
-      setAiReplyBody("");
-      setAiReplyThinking("");
-      setAiDraftBody(null);
-      setAiDraftLoading(false);
-      setAiDraftError(null);
     } catch (e) {
       setStatusMessage(String(e));
     } finally {
@@ -1809,6 +1875,21 @@ export default function InboxPage({ active }: { active: boolean }) {
 
       {ctxMenu.menu && (
         <ContextMenuView menu={ctxMenu.menu} onClose={ctxMenu.hide} />
+      )}
+
+      {undoSend && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-lg bg-foreground px-4 py-2.5 shadow-lg text-background text-sm animate-in fade-in slide-in-from-bottom-2">
+          <span className="truncate max-w-[260px]">
+            Sending &ldquo;{undoSend.subject || "(no subject)"}&rdquo;…
+          </span>
+          <button
+            type="button"
+            onClick={handleUndoSend}
+            className="font-medium underline underline-offset-2 hover:opacity-80 whitespace-nowrap"
+          >
+            Undo
+          </button>
+        </div>
       )}
     </div>
   );

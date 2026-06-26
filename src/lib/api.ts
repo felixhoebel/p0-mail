@@ -161,12 +161,17 @@ export async function queueEmail(params: {
   attachments?: AttachmentPayload[];
   inReplyTo?: string;
   references?: string[];
-}): Promise<void> {
+  deferSeconds?: number;
+}): Promise<number> {
   return invoke("queue_email", params);
 }
 
 export async function processSendQueue(): Promise<void> {
   return invoke("process_send_queue");
+}
+
+export async function cancelSend(queueId: number): Promise<boolean> {
+  return invoke("cancel_send", { queueId });
 }
 
 export async function getSendQueue(): Promise<SendQueueItem[]> {
