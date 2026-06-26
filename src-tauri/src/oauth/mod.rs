@@ -25,24 +25,27 @@ pub const MICROSOFT_TOKEN_URL: &str =
 pub const MICROSOFT_SCOPE: &str =
     "openid email offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send";
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+fn env_or(key: &str, compiled: Option<&str>) -> String {
+    match std::env::var(key) {
+        Ok(v) if !v.is_empty() => v,
+        _ => compiled.unwrap_or("").to_string(),
+    }
 }
 
 pub fn google_client_id() -> String {
-    env_or("GOOGLE_CLIENT_ID", "")
+    env_or("GOOGLE_CLIENT_ID", option_env!("GOOGLE_CLIENT_ID"))
 }
 
 pub fn google_client_secret() -> String {
-    env_or("GOOGLE_CLIENT_SECRET", "")
+    env_or("GOOGLE_CLIENT_SECRET", option_env!("GOOGLE_CLIENT_SECRET"))
 }
 
 pub fn microsoft_client_id() -> String {
-    env_or("MICROSOFT_CLIENT_ID", "")
+    env_or("MICROSOFT_CLIENT_ID", option_env!("MICROSOFT_CLIENT_ID"))
 }
 
 pub fn microsoft_client_secret() -> String {
-    env_or("MICROSOFT_CLIENT_SECRET", "")
+    env_or("MICROSOFT_CLIENT_SECRET", option_env!("MICROSOFT_CLIENT_SECRET"))
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
