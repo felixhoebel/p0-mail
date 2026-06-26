@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Sparkles,
   X,
@@ -6,6 +6,11 @@ import {
   RefreshCw,
   ChevronDown,
   Brain,
+  Forward,
+  Send,
+  Reply,
+  Copy,
+  Check,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { AiPanelLabels } from "@/lib/aiUi";
@@ -18,6 +23,10 @@ type AiSummaryPanelProps = {
   error: string | null;
   onDismiss: () => void;
   onRetry?: () => void;
+  onForwardSummary?: () => void;
+  onSendAsNew?: () => void;
+  onReplyWithSummary?: () => void;
+  onCopySummary?: () => void;
 };
 
 export default function AiSummaryPanel({
@@ -28,8 +37,28 @@ export default function AiSummaryPanel({
   error,
   onDismiss,
   onRetry,
+  onForwardSummary,
+  onSendAsNew,
+  onReplyWithSummary,
+  onCopySummary,
 }: AiSummaryPanelProps) {
   const [thinkingExpanded, setThinkingExpanded] = useState(true);
+  const [copied, setCopied] = useState(false);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(
+    () => () => {
+      if (copyTimer.current) clearTimeout(copyTimer.current);
+    },
+    [],
+  );
+
+  const handleCopy = () => {
+    onCopySummary?.();
+    setCopied(true);
+    if (copyTimer.current) clearTimeout(copyTimer.current);
+    copyTimer.current = setTimeout(() => setCopied(false), 1500);
+  };
 
   if (summary === null && !loading && !error && !thinking) return null;
 
@@ -139,6 +168,63 @@ export default function AiSummaryPanel({
                   <span className="inline-block w-0.5 h-4 bg-ai/80 animate-pulse ml-0.5 align-text-bottom" />
                 )}
               </div>
+            </div>
+          )}
+
+          {!error && hasSummary && !loading && (
+            <div className="flex flex-wrap gap-1.5">
+              {onForwardSummary && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-[11px] gap-1 px-2"
+                  onClick={onForwardSummary}
+                  title={labels.forwardSummary}
+                >
+                  <Forward className="h-3 w-3" />
+                  {labels.forwardSummary}
+                </Button>
+              )}
+              {onSendAsNew && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-[11px] gap-1 px-2"
+                  onClick={onSendAsNew}
+                  title={labels.sendAsNew}
+                >
+                  <Send className="h-3 w-3" />
+                  {labels.sendAsNew}
+                </Button>
+              )}
+              {onReplyWithSummary && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-[11px] gap-1 px-2"
+                  onClick={onReplyWithSummary}
+                  title={labels.replyWithSummary}
+                >
+                  <Reply className="h-3 w-3" />
+                  {labels.replyWithSummary}
+                </Button>
+              )}
+              {onCopySummary && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-[11px] gap-1 px-2"
+                  onClick={handleCopy}
+                  title={labels.copy}
+                >
+                  {copied ? (
+                    <Check className="h-3 w-3 text-ai" />
+                  ) : (
+                    <Copy className="h-3 w-3" />
+                  )}
+                  {copied ? labels.copied : labels.copy}
+                </Button>
+              )}
             </div>
           )}
 

@@ -179,6 +179,7 @@ impl AiService {
         thread_id: i64,
         email_ids: &[i64],
         tone: &str,
+        summary: Option<&str>,
     ) -> Result<(), String> {
         let settings = self.get_settings(tone).map_err(|e| {
             emit_stream_error(app, stream_id, &e);
@@ -198,7 +199,7 @@ impl AiService {
             emit_stream_error(app, stream_id, &e);
             e
         })?;
-        let prompt = self.build_reply_prompt(&emails, &settings);
+        let prompt = self.build_reply_prompt(&emails, &settings, summary);
         self.stream_chat(
             app,
             stream_id,
@@ -603,7 +604,12 @@ impl AiService {
         ]
     }
 
-    fn build_reply_prompt(&self, emails: &[ThreadEmail], settings: &AiSettings) -> Vec<ChatMessage> {
+    fn build_reply_prompt(
+        &self,
+        emails: &[ThreadEmail],
+        settings: &AiSettings,
+        summary: Option<&str>,
+    ) -> Vec<ChatMessage> {
         let thread_text = self.format_thread(emails);
         let language = output_language_name(&settings.output_language);
 
@@ -619,6 +625,20 @@ impl AiService {
         );
         append_custom_instructions(&mut system, &settings.custom_instructions);
 
+        let mut user_content = String::new();
+        if let Some(s) = summary {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                user_content.push_str(
+                    "The following is an AI-generated summary of this thread. \
+                     Use it as additional context when drafting the reply and refer to it where it helps:\n\n",
+                );
+                user_content.push_str(trimmed);
+                user_content.push_str("\n\n--- THREAD ---\n\n");
+            }
+        }
+        user_content.push_str(&thread_text);
+
         vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -626,7 +646,7 @@ impl AiService {
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: thread_text,
+                content: user_content,
             },
         ]
     }

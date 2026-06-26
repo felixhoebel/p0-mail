@@ -2,7 +2,7 @@
 
 > **Purpose.** Self-contained workstream specs for autonomous agents. Each task lists what to build, which files to touch, dependencies, and how to verify. Pick a phase → pick a task → execute end-to-end.
 
-**Current state:** Phase 1-3 complete (DB encrypted at rest, background polling, new-mail notifications, FTS5 search, CI signing, OAuth + IMAP + AI streaming, attachments, folders, drafts, reply-all/forward, virtualization, error boundary, sync health). Phase 4 (UX differentiators: command palette, undo send, snooze) + Phase 5 (code-quality refactors: lib.rs/InboxPage god-modules) remaining. An audit found a few latent bugs in "complete" tasks (see 5.2 FTS bug ✅fixed, mark_read swallows IMAP errors, handleArchive/handleDelete swallow backend errors) — these are tracked in Phase 5.
+**Current state:** Phase 1-3 complete (DB encrypted at rest, background polling, new-mail notifications, FTS5 search, CI signing, OAuth + IMAP + AI streaming, attachments, folders, drafts, reply-all/forward, virtualization, error boundary, sync health). Phase 4 in progress: 4.1 Command palette ✅, 4.9 AI summary workflow ✅; remaining (undo send, snooze, schedule, autocomplete, bundles, per-account settings, live theme). Phase 5 (code-quality refactors: lib.rs/InboxPage god-modules) partially done (5.1-5.3 ✅; 5.4-5.6 pending). An audit found a few latent bugs in "complete" tasks (see 5.2 FTS bug ✅fixed, mark_read swallows IMAP errors, handleArchive/handleDelete swallow backend errors) — these are tracked in Phase 5.
 
 **Conventions:** Conventional commits (`feat:`, `fix:`, `security:`, `chore:`). No comments unless asked. Rust in `src-tauri/src/`, React in `src/`. Verify with `cargo test` + `npm run build` (CI runs `tsc --noEmit` + build).
 
@@ -252,6 +252,7 @@ Driven by an architecture audit of the two largest files (`lib.rs` 1957 LOC, `In
 **Files:** `src/components/ui/command-palette.tsx`, `src/App.tsx`, `src/lib/api.ts`.
 **Verify:** ⌘K → type "set" → Enter → Settings. Type sender name → Enter → opens thread.
 **Depends on:** 2.5 (virtualized list helps scale search).
+**Status:** ✅ COMPLETE — palette renders globally via `InboxPage` (always-mounted) + portal; fuzzy matcher in `src/lib/fuzzy.ts`; thread search reuses `search_emails` FTS (matches subject/from/to/body); actions wired (compose/sync/settings/mark-all-read/archive-selected); added backend `mark_all_read` command for bulk local read-state.
 
 ### 4.2 Undo send (5–10s grace window)
 **Spec:** On send, hold in `send_queue` with `status = 'sending'` + `send_after = now + 8s`. Show a toast "Sent — Undo" for 8s. If undone, move to drafts. Otherwise process queue.
@@ -285,6 +286,24 @@ Driven by an architecture audit of the two largest files (`lib.rs` 1957 LOC, `In
 **Spec:** `matchMedia('(prefers-color-scheme: dark)')` listener updates theme live.
 **Files:** `src/App.tsx`.
 **Verify:** Toggle OS theme → app updates instantly.
+
+### 4.9 AI summary → email workflow integration
+**Problem:** `AiSummaryPanel` only exposes `onDismiss`/`onRetry`. A generated summary is a dead end — the user must manually copy-paste it into a compose window. The summary is also never reused as context for downstream AI actions (e.g. drafting a reply that accounts for the summary).
+**Spec:**
+Four actions on the summary panel, shown as a button row beneath the summary text when `summary` is non-empty and `!loading`:
+1. **Forward summary** — `Fwd:` framing with the AI summary on top and the original (last) thread email quoted below. Opens the full `ComposeEditor` (not inline) with blank recipients.
+2. **Send as new** — Fresh email with the summary as the body, subject `Summary: <thread subject>`, blank recipients, no threading headers.
+3. **Reply with summary** — Drafts an AI reply in the inline reply editor, passing the existing summary to the backend as extra context so the reply can reference it.
+4. **Copy** — `navigator.clipboard.writeText(summary)` with a transient "Copied!" state.
+**Files:**
+- `src/components/ai/AiSummaryPanel.tsx` — add optional props `onForwardSummary?`, `onSendAsNew?`, `onCopySummary?`, `onReplyWithSummary?`; render action row beneath summary text.
+- `src/lib/aiUi.ts` — extend `AiPanelLabels` with `forwardSummary`, `sendAsNew`, `replyWithSummary`, `copy`, `copied` (de/en/no).
+- `src/pages/InboxPage.tsx` — add `handleForwardSummary`, `handleSendSummaryAsNew`, `handleCopySummary`, `handleDraftReplyWithSummary`; wire into `<AiSummaryPanel>` render.
+- `src/lib/api.ts` — `streamDraftReply` gains optional `summary?: string` arg.
+- `src-tauri/src/ai/mod.rs` — `stream_draft_reply` + `build_reply_prompt` accept `summary: Option<&str>`; when `Some` and non-empty, inject before thread text in the user message.
+- `src-tauri/src/lib.rs` — `stream_draft_reply` Tauri command gains `summary: Option<String>`.
+**Verify:** Generate a summary → each of the 4 buttons works (forward opens compose with summary + quote; send-as-new opens compose with summary only; reply-with-summary drafts a reply that references the summary; copy writes to clipboard). `cargo check` + `npx tsc --noEmit` clean.
+**Depends on:** nothing (builds on existing summarize + compose machinery).
 
 ---
 
@@ -333,7 +352,7 @@ When picking up a task:
 - [x] 3.3 Sync health
 - [x] 3.4 IMAP validation leak
 - [x] 3.5 Input validation
-- [ ] 4.1 Command palette
+- [x] 4.1 Command palette
 - [ ] 4.2 Undo send
 - [ ] 4.3 Schedule send
 - [ ] 4.4 Snooze/reminders
@@ -341,6 +360,7 @@ When picking up a task:
 - [ ] 4.6 Smart bundles
 - [ ] 4.7 Per-account settings
 - [ ] 4.8 Live theme sync
+- [x] 4.9 AI summary → email workflow integration
 
 ## Phase 5 — Code Quality
 - [x] 5.1 IMAP session helper (lib.rs)

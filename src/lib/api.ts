@@ -83,6 +83,10 @@ export function onOpenThread(
   return listen("open-thread", (e) => callback(Number(e.payload)));
 }
 
+export function onAiConfigChanged(callback: () => void): Promise<UnlistenFn> {
+  return listen("ai-config-changed", () => callback());
+}
+
 // Threads & Emails
 export async function listThreads(params: {
   accountId?: number;
@@ -113,6 +117,13 @@ export async function reindexAccount(accountId: number): Promise<void> {
 // Mail Actions
 export async function markRead(emailId: number, read: boolean): Promise<void> {
   return invoke("mark_read", { emailId, read });
+}
+
+export async function markAllRead(params: {
+  accountId?: number;
+  folder?: string;
+}): Promise<number> {
+  return invoke("mark_all_read", params);
 }
 
 export async function archiveEmail(emailId: number): Promise<void> {
@@ -242,8 +253,9 @@ export async function streamDraftReply(
   threadId: number,
   emailIds: number[],
   tone: AiTone,
+  summary?: string,
 ): Promise<void> {
-  return invoke("stream_draft_reply", { streamId, threadId, emailIds, tone });
+  return invoke("stream_draft_reply", { streamId, threadId, emailIds, tone, summary });
 }
 
 export async function streamAiTransform(

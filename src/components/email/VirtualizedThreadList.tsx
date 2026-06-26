@@ -1,4 +1,4 @@
-import { useRef, useCallback, useEffect, useState } from "react";
+import { useRef, useCallback, useEffect, useLayoutEffect, useState } from "react";
 import { List, type RowComponentProps } from "react-window";
 import type { Thread } from "@/types";
 
@@ -53,6 +53,7 @@ interface RowProps {
   busyThreadIds: Set<number>;
   onSelectThread: (thread: Thread) => void;
   onContextMenu: (e: React.MouseEvent, thread: Thread) => void;
+  loadingMore: boolean;
 }
 
 function ThreadRowItem({
@@ -63,7 +64,17 @@ function ThreadRowItem({
   busyThreadIds,
   onSelectThread,
   onContextMenu,
+  loadingMore,
 }: RowComponentProps<RowProps>) {
+  if (index >= rows.length) {
+    return (
+      <div style={style} className="flex items-center justify-center">
+        {loadingMore && (
+          <span className="block h-3.5 w-3.5 animate-spin rounded-full border border-muted-foreground border-t-transparent" />
+        )}
+      </div>
+    );
+  }
   const row = rows[index];
   if (row.type === "header") {
     return (
@@ -122,6 +133,7 @@ interface VirtualizedThreadListProps {
   hasMore?: boolean;
   onLoadMore?: () => void;
   loadingMore?: boolean;
+  active?: boolean;
 }
 
 export default function VirtualizedThreadList({
@@ -133,6 +145,7 @@ export default function VirtualizedThreadList({
   hasMore = false,
   onLoadMore,
   loadingMore = false,
+  active = true,
 }: VirtualizedThreadListProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [height, setHeight] = useState(600);
@@ -146,6 +159,13 @@ export default function VirtualizedThreadList({
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
+
+  useLayoutEffect(() => {
+    if (!active) return;
+    const el = containerRef.current;
+    if (!el) return;
+    setHeight(el.clientHeight);
+  }, [active]);
 
   const rows = buildThreadRows(threads);
   const rowCount = rows.length + (hasMore ? 1 : 0);
@@ -173,6 +193,7 @@ export default function VirtualizedThreadList({
     busyThreadIds,
     onSelectThread,
     onContextMenu,
+    loadingMore,
   };
 
   return (
@@ -187,11 +208,6 @@ export default function VirtualizedThreadList({
         style={{ height, width: "100%" }}
         className="scrollbar-thin"
       />
-      {loadingMore && (
-        <div className="flex items-center justify-center py-2">
-          <span className="block h-3.5 w-3.5 animate-spin rounded-full border border-muted-foreground border-t-transparent" />
-        </div>
-      )}
     </div>
   );
 }

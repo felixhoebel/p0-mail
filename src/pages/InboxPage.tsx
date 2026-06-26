@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback, useRef } from "react";
-import { Link } from "react-router-dom";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { Loader2, Settings, Search, RefreshCw, Archive, Trash2, MailOpen, Mail, PenSquare, Reply, ReplyAll, Forward, CornerDownLeft, Sparkles, MessageSquare } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import {
   triggerSync,
   searchEmails,
   markRead,
+  markAllRead,
   archiveEmail,
   deleteEmail,
   sendEmail,
@@ -26,6 +27,7 @@ import {
   onAiStream,
   onAiStreamError,
   onMailSynced,
+  onAiConfigChanged,
 } from "@/lib/api";
 import type { Account, Folder, Thread, Email, SendQueueItem, AiConfig, AiTone, AttachmentPayload } from "@/types";
 import EmailViewer from "@/components/email/EmailViewer";
@@ -37,6 +39,7 @@ import AiThinkingStrip from "@/components/ai/AiThinkingStrip";
 import AiInlineToolbar from "@/components/ai/AiInlineToolbar";
 import EmailChatPanel from "@/components/ai/EmailChatPanel";
 import { useContextMenu, ContextMenuView } from "@/components/ui/context-menu";
+import { CommandPalette, type PaletteAction } from "@/components/ui/command-palette";
 import {
   getAiActionLabels,
   getAiPanelLabels,
@@ -330,7 +333,8 @@ function InlineReplyEditor({
   );
 }
 
-export default function InboxPage() {
+export default function InboxPage({ active }: { active: boolean }) {
+  const navigate = useNavigate();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [selectedAccount, setSelectedAccount] = useState<number | null>(null);
   const [folders, setFolders] = useState<Folder[]>([]);
@@ -339,11 +343,14 @@ export default function InboxPage() {
   const [selectedThread, setSelectedThread] = useState<number | null>(null);
   const [emails, setEmails] = useState<Email[]>([]);
   const [selectedEmail, setSelectedEmail] = useState<number | null>(null);
+  const selectedThreadRef = useRef<number | null>(null);
+  selectedThreadRef.current = selectedThread;
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<Thread[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [composing, setComposing] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
   const [threadOffset, setThreadOffset] = useState(0);
@@ -516,6 +523,24 @@ export default function InboxPage() {
     };
   }, [loadThreads]);
 
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let alive = true;
+    onAiConfigChanged(() => {
+      getAiConfig().then(setAiConfig).catch(() => setAiConfig(null));
+    }).then((fn) => {
+      if (!alive) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+    });
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
+  }, []);
+
   const resetAiStream = useCallback(() => {
     activeStreamIdRef.current = null;
     activeStreamKindRef.current = null;
@@ -634,10 +659,12 @@ export default function InboxPage() {
 
   const handleSelectThread = async (thread: Thread) => {
     setSelectedThread(thread.id);
+    selectedThreadRef.current = thread.id;
     clearAiState();
     setShowInlineReply(false);
     try {
       const list = await getEmails(thread.id);
+      if (selectedThreadRef.current !== thread.id) return;
       setEmails(list);
       if (list.length > 0) {
         const focusId = list[list.length - 1].id;
@@ -646,6 +673,7 @@ export default function InboxPage() {
         const unread = list.filter((e) => !e.is_read);
         if (unread.length > 0) {
           await Promise.all(unread.map((e) => markRead(e.id, true).catch(console.error)));
+          if (selectedThreadRef.current !== thread.id) return;
           const updated = list.map((e) => ({ ...e, is_read: true }));
           setEmails(updated);
           setThreads((prev) =>
@@ -657,7 +685,9 @@ export default function InboxPage() {
           if (!email.body_html && !email.body_text) {
             fetchThreadBodies(thread.id)
               .then(async () => {
+                if (selectedThreadRef.current !== thread.id) return;
                 const refreshed = await getEmails(thread.id);
+                if (selectedThreadRef.current !== thread.id) return;
                 setEmails(refreshed);
               })
               .catch((e) => setStatusMessage(String(e)));
@@ -715,44 +745,54 @@ export default function InboxPage() {
     const threadId = selectedThread;
     if (threadId) setBusyThreadIds((prev) => new Set(prev).add(threadId));
     setBusyEmailIds((prev) => new Set(prev).add(emailId));
-    await archiveEmail(emailId).catch(console.error);
-    setBusyEmailIds((prev) => { const n = new Set(prev); n.delete(emailId); return n; });
-    if (threadId) {
-      const remaining = await getEmails(threadId).catch(() => []);
-      if (remaining.length === 0) {
-        setThreads((prev) => prev.filter((t) => t.id !== threadId));
-        setSelectedThread(null);
-        setSelectedEmail(null);
-        setEmails([]);
-      } else {
-        setEmails(remaining);
-        setSelectedEmail(remaining[remaining.length - 1].id);
+    try {
+      await archiveEmail(emailId).catch(console.error);
+      if (threadId) {
+        const remaining = await getEmails(threadId).catch(() => []);
+        if (selectedThreadRef.current !== threadId) return;
+        if (remaining.length === 0) {
+          setThreads((prev) => prev.filter((t) => t.id !== threadId));
+          setSelectedThread(null);
+          selectedThreadRef.current = null;
+          setSelectedEmail(null);
+          setEmails([]);
+        } else {
+          setEmails(remaining);
+          setSelectedEmail(remaining[remaining.length - 1].id);
+        }
       }
+    } finally {
+      setBusyEmailIds((prev) => { const n = new Set(prev); n.delete(emailId); return n; });
+      setBusyThreadIds((prev) => { const n = new Set(prev); if (threadId) n.delete(threadId); return n; });
+      loadThreads();
     }
-    setBusyThreadIds((prev) => { const n = new Set(prev); if (threadId) n.delete(threadId); return n; });
-    loadThreads();
   }, [selectedThread, loadThreads]);
 
   const handleDelete = useCallback(async (emailId: number) => {
     const threadId = selectedThread;
     if (threadId) setBusyThreadIds((prev) => new Set(prev).add(threadId));
     setBusyEmailIds((prev) => new Set(prev).add(emailId));
-    await deleteEmail(emailId).catch(console.error);
-    setBusyEmailIds((prev) => { const n = new Set(prev); n.delete(emailId); return n; });
-    if (threadId) {
-      const remaining = await getEmails(threadId).catch(() => []);
-      if (remaining.length === 0) {
-        setThreads((prev) => prev.filter((t) => t.id !== threadId));
-        setSelectedThread(null);
-        setSelectedEmail(null);
-        setEmails([]);
-      } else {
-        setEmails(remaining);
-        setSelectedEmail(remaining[remaining.length - 1].id);
+    try {
+      await deleteEmail(emailId).catch(console.error);
+      if (threadId) {
+        const remaining = await getEmails(threadId).catch(() => []);
+        if (selectedThreadRef.current !== threadId) return;
+        if (remaining.length === 0) {
+          setThreads((prev) => prev.filter((t) => t.id !== threadId));
+          setSelectedThread(null);
+          selectedThreadRef.current = null;
+          setSelectedEmail(null);
+          setEmails([]);
+        } else {
+          setEmails(remaining);
+          setSelectedEmail(remaining[remaining.length - 1].id);
+        }
       }
+    } finally {
+      setBusyEmailIds((prev) => { const n = new Set(prev); n.delete(emailId); return n; });
+      setBusyThreadIds((prev) => { const n = new Set(prev); if (threadId) n.delete(threadId); return n; });
+      loadThreads();
     }
-    setBusyThreadIds((prev) => { const n = new Set(prev); if (threadId) n.delete(threadId); return n; });
-    loadThreads();
   }, [selectedThread, loadThreads]);
 
   const openReplyComposer = useCallback((email: Email) => {
@@ -845,8 +885,85 @@ export default function InboxPage() {
     setComposing(true);
   }, []);
 
+  const handleMarkAllRead = useCallback(async () => {
+    try {
+      const count = await markAllRead({
+        accountId: selectedAccount || undefined,
+        folder: selectedFolder || undefined,
+      });
+      setThreads((prev) => prev.map((t) => ({ ...t, is_read: true })));
+      if (count > 0) {
+        setStatusMessage(`Marked ${count} email${count === 1 ? "" : "s"} as read.`);
+      } else {
+        setStatusMessage("No unread emails.");
+      }
+    } catch (e) {
+      setStatusMessage(String(e));
+    }
+  }, [selectedAccount, selectedFolder]);
+
+  const handlePaletteSelectThread = useCallback(
+    (thread: Thread) => {
+      navigate("/");
+      setSelectedThread(thread.id);
+      selectedThreadRef.current = thread.id;
+      handleSelectThread(thread);
+    },
+    [navigate, handleSelectThread],
+  );
+
+  const handlePaletteSelectAccount = useCallback(
+    (account: Account) => {
+      navigate("/");
+      setSelectedAccount(account.id);
+    },
+    [navigate],
+  );
+
+  const paletteActions = useMemo<PaletteAction[]>(
+    () => [
+      {
+        id: "compose",
+        label: "New compose",
+        hint: "⌘N",
+        icon: PenSquare,
+        run: () => openNewComposer(),
+      },
+      {
+        id: "sync",
+        label: "Sync mail",
+        hint: "Refresh now",
+        icon: RefreshCw,
+        run: () => void handleSync(),
+      },
+      {
+        id: "settings",
+        label: "Settings",
+        icon: Settings,
+        run: () => navigate("/settings"),
+      },
+      {
+        id: "mark-all-read",
+        label: "Mark all as read",
+        icon: MailOpen,
+        run: () => void handleMarkAllRead(),
+      },
+      {
+        id: "archive-selected",
+        label: "Archive selected email",
+        icon: Archive,
+        disabled: !selectedEmailData,
+        run: () => {
+          if (selectedEmailData) void handleArchive(selectedEmailData.id);
+        },
+      },
+    ],
+    [openNewComposer, handleSync, navigate, handleMarkAllRead, selectedEmailData, handleArchive],
+  );
+
   const handleSummarize = async () => {
     if (!selectedThread || !aiConfig || emails.length === 0) return;
+    const threadId = selectedThread;
     resetAiStream();
     setAiSummaryLoading(true);
     setAiSummaryError(null);
@@ -855,12 +972,13 @@ export default function InboxPage() {
 
     try {
       const hydrated = await hydrateEmailBodies(emails);
+      if (selectedThreadRef.current !== threadId) return;
       setEmails(hydrated);
       const emailIds = hydrated.map((e) => e.id);
       const streamId = crypto.randomUUID();
       activeStreamIdRef.current = streamId;
       activeStreamKindRef.current = "summary";
-      await streamSummarizeThread(streamId, selectedThread, emailIds, aiTone);
+      await streamSummarizeThread(streamId, threadId, emailIds, aiTone);
     } catch (e) {
       setAiSummaryError(String(e));
       setAiSummaryLoading(false);
@@ -868,8 +986,9 @@ export default function InboxPage() {
     }
   };
 
-  const handleDraftReply = async () => {
+  const runDraftReply = async (summary?: string) => {
     if (!selectedThread || !lastEmail || !aiConfig || emails.length === 0) return;
+    const threadId = selectedThread;
     resetAiStream();
     setAiDraftError(null);
     setAiReplyBody("");
@@ -880,12 +999,13 @@ export default function InboxPage() {
 
     try {
       const hydrated = await hydrateEmailBodies(emails);
+      if (selectedThreadRef.current !== threadId) return;
       setEmails(hydrated);
       const emailIds = hydrated.map((e) => e.id);
       const streamId = crypto.randomUUID();
       activeStreamIdRef.current = streamId;
       activeStreamKindRef.current = "reply";
-      await streamDraftReply(streamId, selectedThread, emailIds, aiTone);
+      await streamDraftReply(streamId, selectedThread, emailIds, aiTone, summary);
     } catch (e) {
       setAiDraftError(String(e));
       setStatusMessage(String(e));
@@ -893,6 +1013,57 @@ export default function InboxPage() {
       resetAiStream();
     }
   };
+
+  const handleDraftReply = () => {
+    void runDraftReply();
+  };
+
+  const handleDraftReplyWithSummary = () => {
+    if (!aiSummary) return;
+    void runDraftReply(aiSummary);
+  };
+
+  const handleForwardSummary = useCallback(() => {
+    if (!aiSummary) return;
+    const base = lastEmail ?? emails[emails.length - 1];
+    const fwdSubject = base?.subject
+      ? base.subject.startsWith("Fwd:") || base.subject.startsWith("fwd:")
+        ? base.subject
+        : `Fwd: ${base.subject}`
+      : "";
+    const summaryHtml = plainTextToHtml(aiSummary);
+    const quote = base ? buildReplyQuoteBody(base) : "";
+    const body = quote ? `${summaryHtml}<br>${quote}` : summaryHtml;
+    setComposeTo("");
+    setComposeCc("");
+    setComposeSubject(fwdSubject);
+    setComposeBodyHtml(body);
+    setComposeInReplyTo(undefined);
+    setComposeReferences(undefined);
+    setAiDraftBody(null);
+    setShowInlineReply(false);
+    setComposing(true);
+  }, [aiSummary, lastEmail, emails]);
+
+  const handleSendSummaryAsNew = useCallback(() => {
+    if (!aiSummary) return;
+    const base = lastEmail ?? emails[emails.length - 1];
+    const subject = base?.subject ? `Summary: ${base.subject}` : "Summary";
+    setComposeTo("");
+    setComposeCc("");
+    setComposeSubject(subject);
+    setComposeBodyHtml(plainTextToHtml(aiSummary));
+    setComposeInReplyTo(undefined);
+    setComposeReferences(undefined);
+    setAiDraftBody(null);
+    setShowInlineReply(false);
+    setComposing(true);
+  }, [aiSummary, lastEmail, emails]);
+
+  const handleCopySummary = useCallback(() => {
+    if (!aiSummary) return;
+    navigator.clipboard?.writeText(aiSummary).catch(() => {});
+  }, [aiSummary]);
 
   const handleManualReply = () => {
     if (!lastEmail) return;
@@ -958,18 +1129,22 @@ export default function InboxPage() {
           onClick: async () => {
             setBusyThreadIds((prev) => new Set(prev).add(thread.id));
             const fetched = await getEmails(thread.id).catch(() => []);
-            for (const em of fetched) {
-              setBusyEmailIds((prev) => new Set(prev).add(em.id));
-              await archiveEmail(em.id).catch(() => {});
-              setBusyEmailIds((prev) => { const n = new Set(prev); n.delete(em.id); return n; });
+            try {
+              for (const em of fetched) {
+                setBusyEmailIds((prev) => new Set(prev).add(em.id));
+                await archiveEmail(em.id).catch(console.error);
+                setBusyEmailIds((prev) => { const n = new Set(prev); n.delete(em.id); return n; });
+              }
+              if (selectedThreadRef.current === thread.id) {
+                setSelectedThread(null);
+                selectedThreadRef.current = null;
+                setSelectedEmail(null);
+                setEmails([]);
+              }
+            } finally {
+              setBusyThreadIds((prev) => { const n = new Set(prev); n.delete(thread.id); return n; });
+              loadThreads();
             }
-            if (selectedThread === thread.id) {
-              setSelectedThread(null);
-              setSelectedEmail(null);
-              setEmails([]);
-            }
-            setBusyThreadIds((prev) => { const n = new Set(prev); n.delete(thread.id); return n; });
-            loadThreads();
           },
         },
         {
@@ -979,18 +1154,22 @@ export default function InboxPage() {
           onClick: async () => {
             setBusyThreadIds((prev) => new Set(prev).add(thread.id));
             const fetched = await getEmails(thread.id).catch(() => []);
-            for (const em of fetched) {
-              setBusyEmailIds((prev) => new Set(prev).add(em.id));
-              await deleteEmail(em.id).catch(() => {});
-              setBusyEmailIds((prev) => { const n = new Set(prev); n.delete(em.id); return n; });
+            try {
+              for (const em of fetched) {
+                setBusyEmailIds((prev) => new Set(prev).add(em.id));
+                await deleteEmail(em.id).catch(console.error);
+                setBusyEmailIds((prev) => { const n = new Set(prev); n.delete(em.id); return n; });
+              }
+              if (selectedThreadRef.current === thread.id) {
+                setSelectedThread(null);
+                selectedThreadRef.current = null;
+                setSelectedEmail(null);
+                setEmails([]);
+              }
+            } finally {
+              setBusyThreadIds((prev) => { const n = new Set(prev); n.delete(thread.id); return n; });
+              loadThreads();
             }
-            if (selectedThread === thread.id) {
-              setSelectedThread(null);
-              setSelectedEmail(null);
-              setEmails([]);
-            }
-            setBusyThreadIds((prev) => { const n = new Set(prev); n.delete(thread.id); return n; });
-            loadThreads();
           },
         },
       ]);
@@ -1047,8 +1226,15 @@ export default function InboxPage() {
         {
           label: email.is_read ? "Mark unread" : "Mark read",
           onClick: async () => {
-            await markRead(email.id, !email.is_read).catch(console.error);
-            setEmails((prev) => prev.map((em) => em.id === email.id ? { ...em, is_read: !email.is_read } : em));
+            const newRead = !email.is_read;
+            await markRead(email.id, newRead).catch(console.error);
+            setEmails((prev) => prev.map((em) => em.id === email.id ? { ...em, is_read: newRead } : em));
+            setThreads((prev) => prev.map((t) => {
+              if (t.id !== email.thread_id) return t;
+              if (!newRead) return { ...t, is_read: false };
+              const allRead = emails.every((em) => em.id === email.id ? newRead : em.is_read);
+              return { ...t, is_read: allRead };
+            }));
           },
         },
         {
@@ -1076,6 +1262,11 @@ export default function InboxPage() {
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        setPaletteOpen((o) => !o);
+        return;
+      }
       const target = e.target as HTMLElement;
       if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) return;
       const s = kbStateRef.current;
@@ -1128,6 +1319,15 @@ export default function InboxPage() {
 
   return (
     <div className="flex h-full">
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        accounts={accounts}
+        recentThreads={threads}
+        actions={paletteActions}
+        onSelectThread={handlePaletteSelectThread}
+        onSelectAccount={handlePaletteSelectAccount}
+      />
       {/* Thread list */}
       <div className="w-[340px] border-r border-border flex flex-col shrink-0 bg-sidebar">
         {/* Search + Sync */}
@@ -1254,7 +1454,7 @@ export default function InboxPage() {
         )}
 
         {/* Thread items */}
-        <div className="flex-1 overflow-y-auto scrollbar-thin">
+        <div className="flex-1 overflow-y-auto scrollbar-thin flex flex-col">
           {isSearching ? (
             searchResults.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
@@ -1322,6 +1522,7 @@ export default function InboxPage() {
               hasMore={hasMoreThreads}
               onLoadMore={loadMoreThreads}
               loadingMore={loadingMore}
+              active={active}
             />
           )}
         </div>
@@ -1561,6 +1762,10 @@ export default function InboxPage() {
                     setAiSummaryLoading(false);
                   }}
                   onRetry={handleSummarize}
+                  onForwardSummary={handleForwardSummary}
+                  onSendAsNew={handleSendSummaryAsNew}
+                  onReplyWithSummary={handleDraftReplyWithSummary}
+                  onCopySummary={handleCopySummary}
                 />
               )}
 

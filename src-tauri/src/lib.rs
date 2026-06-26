@@ -23,6 +23,7 @@ const POLL_INTERVAL_SECS: u64 = 60;
 const POLL_JITTER_SECS: i64 = 10;
 const POLL_BACKOFF_SECS: u64 = 300;
 const SYNC_TIMEOUT_SECS: u64 = 120;
+const IMAP_OP_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn run_db<F, T>(f: F) -> Result<T, String>
 where
@@ -706,6 +707,22 @@ async fn mark_read(email_id: i64, read: bool) -> Result<(), String> {
             rusqlite::params![read_val, email_id],
         )
         .map_err(|e| e.to_string())?;
+
+        if let Some(tid) = ctx.thread_id {
+            let unread_in_thread: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM emails WHERE thread_id = ?1 AND is_read = 0",
+                    rusqlite::params![tid],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            let thread_read: i64 = if unread_in_thread == 0 { 1 } else { 0 };
+            conn.execute(
+                "UPDATE threads SET is_read = ?1 WHERE id = ?2",
+                rusqlite::params![thread_read, tid],
+            )
+            .map_err(|e| e.to_string())?;
+        }
     }
 
     let host = match ctx.imap_host {
@@ -747,6 +764,40 @@ async fn mark_read(email_id: i64, read: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn mark_all_read(
+    account_id: Option<i64>,
+    folder: Option<String>,
+) -> Result<i64, String> {
+    run_db(move || {
+        let conn = db::get()?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let updated = tx
+            .execute(
+                "UPDATE emails SET is_read = 1 \
+                 WHERE is_read = 0 \
+                 AND (?1 IS NULL OR account_id = ?1) \
+                 AND (?2 IS NULL OR folder = ?2)",
+                rusqlite::params![account_id, folder],
+            )
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE threads SET is_read = 1 \
+             WHERE id IN ( \
+                 SELECT DISTINCT thread_id FROM emails \
+                 WHERE (?1 IS NULL OR account_id = ?1) AND (?2 IS NULL OR folder = ?2) \
+             ) AND NOT EXISTS ( \
+                 SELECT 1 FROM emails e2 WHERE e2.thread_id = threads.id AND e2.is_read = 0 \
+             )",
+            rusqlite::params![account_id, folder],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(updated as i64)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn archive_email(email_id: i64) -> Result<(), String> {
     let ctx = imap_session::load_email_imap_context(email_id)?;
 
@@ -765,48 +816,57 @@ async fn archive_email(email_id: i64) -> Result<(), String> {
     )
     .await?;
 
-    session
-        .select(&ctx.folder)
+    tokio::time::timeout(IMAP_OP_TIMEOUT, session.select(&ctx.folder))
         .await
+        .map_err(|_| format!("SELECT timed out after {IMAP_OP_TIMEOUT:?}"))?
         .map_err(|e| format!("SELECT failed: {:?}", e))?;
 
     if ctx.provider_type == "gmail_oauth" {
-        let stream = session
-            .uid_store(format!("{}", imap_uid), "+X-GM-LABELS ()")
-            .await
-            .map_err(|e| format!("Gmail archive failed: {:?}", e))?;
-        futures::StreamExt::collect::<Vec<_>>(stream).await;
-        let stream = session
-            .uid_store(format!("{}", imap_uid), "-X-GM-LABELS (\\INBOX)")
-            .await
-            .map_err(|e| format!("Gmail remove INBOX label failed: {:?}", e))?;
-        futures::StreamExt::collect::<Vec<_>>(stream).await;
+        let stream = tokio::time::timeout(
+            IMAP_OP_TIMEOUT,
+            session.uid_store(format!("{}", imap_uid), "+X-GM-LABELS ()"),
+        )
+        .await
+        .map_err(|_| format!("Gmail archive timed out after {IMAP_OP_TIMEOUT:?}"))?
+        .map_err(|e| format!("Gmail archive failed: {:?}", e))?;
+        let _ = tokio::time::timeout(IMAP_OP_TIMEOUT, futures::StreamExt::collect::<Vec<_>>(stream)).await;
+        let stream = tokio::time::timeout(
+            IMAP_OP_TIMEOUT,
+            session.uid_store(format!("{}", imap_uid), "-X-GM-LABELS (\\INBOX)"),
+        )
+        .await
+        .map_err(|_| format!("Gmail remove INBOX label timed out after {IMAP_OP_TIMEOUT:?}"))?
+        .map_err(|e| format!("Gmail remove INBOX label failed: {:?}", e))?;
+        let _ = tokio::time::timeout(IMAP_OP_TIMEOUT, futures::StreamExt::collect::<Vec<_>>(stream)).await;
     } else {
-        let archive_result = session.select("Archive").await;
-        if archive_result.is_err() {
-            session
-                .create("Archive")
+        let archive_result = tokio::time::timeout(IMAP_OP_TIMEOUT, session.select("Archive")).await;
+        if archive_result.is_err() || archive_result.as_ref().unwrap().is_err() {
+            tokio::time::timeout(IMAP_OP_TIMEOUT, session.create("Archive"))
                 .await
+                .map_err(|_| format!("CREATE Archive timed out after {IMAP_OP_TIMEOUT:?}"))?
                 .map_err(|e| format!("CREATE Archive failed: {:?}", e))?;
         }
-        session
-            .select(&ctx.folder)
+        tokio::time::timeout(IMAP_OP_TIMEOUT, session.select(&ctx.folder))
             .await
+            .map_err(|_| format!("SELECT timed out after {IMAP_OP_TIMEOUT:?}"))?
             .map_err(|e| format!("SELECT failed: {:?}", e))?;
-        let _ = session
-            .uid_copy(format!("{}", imap_uid), "Archive")
+        let _ = tokio::time::timeout(IMAP_OP_TIMEOUT, session.uid_copy(format!("{}", imap_uid), "Archive"))
             .await
+            .map_err(|_| format!("COPY to Archive timed out after {IMAP_OP_TIMEOUT:?}"))?
             .map_err(|e| format!("COPY to Archive failed: {:?}", e))?;
-        let stream = session
-            .uid_store(format!("{}", imap_uid), "+FLAGS (\\Deleted)")
+        let stream = tokio::time::timeout(
+            IMAP_OP_TIMEOUT,
+            session.uid_store(format!("{}", imap_uid), "+FLAGS (\\Deleted)"),
+        )
+        .await
+        .map_err(|_| format!("DELETE flag timed out after {IMAP_OP_TIMEOUT:?}"))?
+        .map_err(|e| format!("DELETE flag failed: {:?}", e))?;
+        let _ = tokio::time::timeout(IMAP_OP_TIMEOUT, futures::StreamExt::collect::<Vec<_>>(stream)).await;
+        let stream = tokio::time::timeout(IMAP_OP_TIMEOUT, session.expunge())
             .await
-            .map_err(|e| format!("DELETE flag failed: {:?}", e))?;
-        futures::StreamExt::collect::<Vec<_>>(stream).await;
-        let stream = session
-            .expunge()
-            .await
+            .map_err(|_| format!("EXPUNGE timed out after {IMAP_OP_TIMEOUT:?}"))?
             .map_err(|e| format!("EXPUNGE failed: {:?}", e))?;
-        futures::StreamExt::collect::<Vec<_>>(stream).await;
+        let _ = tokio::time::timeout(IMAP_OP_TIMEOUT, futures::StreamExt::collect::<Vec<_>>(stream)).await;
     }
 
     {
@@ -842,21 +902,24 @@ async fn delete_email(email_id: i64) -> Result<(), String> {
     )
     .await?;
 
-    session
-        .select(&ctx.folder)
+    tokio::time::timeout(IMAP_OP_TIMEOUT, session.select(&ctx.folder))
         .await
+        .map_err(|_| format!("SELECT timed out after {IMAP_OP_TIMEOUT:?}"))?
         .map_err(|e| format!("SELECT failed: {:?}", e))?;
 
-    let stream = session
-        .uid_store(format!("{}", imap_uid), "+FLAGS (\\Deleted)")
+    let stream = tokio::time::timeout(
+        IMAP_OP_TIMEOUT,
+        session.uid_store(format!("{}", imap_uid), "+FLAGS (\\Deleted)"),
+    )
+    .await
+    .map_err(|_| format!("DELETE flag timed out after {IMAP_OP_TIMEOUT:?}"))?
+    .map_err(|e| format!("DELETE flag failed: {:?}", e))?;
+    let _ = tokio::time::timeout(IMAP_OP_TIMEOUT, futures::StreamExt::collect::<Vec<_>>(stream)).await;
+    let stream = tokio::time::timeout(IMAP_OP_TIMEOUT, session.expunge())
         .await
-        .map_err(|e| format!("DELETE flag failed: {:?}", e))?;
-    futures::StreamExt::collect::<Vec<_>>(stream).await;
-    let stream = session
-        .expunge()
-        .await
+        .map_err(|_| format!("EXPUNGE timed out after {IMAP_OP_TIMEOUT:?}"))?
         .map_err(|e| format!("EXPUNGE failed: {:?}", e))?;
-    futures::StreamExt::collect::<Vec<_>>(stream).await;
+    let _ = tokio::time::timeout(IMAP_OP_TIMEOUT, futures::StreamExt::collect::<Vec<_>>(stream)).await;
 
     {
         let conn = db::get()?;
@@ -1329,7 +1392,7 @@ async fn get_ai_config() -> Result<Option<models::AiConfig>, String> {
 }
 
 #[tauri::command]
-async fn set_ai_config(config: models::AiConfig) -> Result<(), String> {
+async fn set_ai_config(app: tauri::AppHandle, config: models::AiConfig) -> Result<(), String> {
     run_db(move || {
         let conn = db::get()?;
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -1351,7 +1414,9 @@ async fn set_ai_config(config: models::AiConfig) -> Result<(), String> {
         secure::store_ai_api_key(&config.api_key)?;
         Ok(())
     })
-    .await
+    .await?;
+    let _ = app.emit("ai-config-changed", ());
+    Ok(())
 }
 
 #[tauri::command]
@@ -1398,9 +1463,10 @@ async fn stream_draft_reply(
     thread_id: i64,
     email_ids: Vec<i64>,
     tone: String,
+    summary: Option<String>,
 ) -> Result<(), String> {
     ai::AiService::new()
-        .stream_draft_reply(&app, &stream_id, thread_id, &email_ids, &tone)
+        .stream_draft_reply(&app, &stream_id, thread_id, &email_ids, &tone, summary.as_deref())
         .await
 }
 
@@ -1898,7 +1964,15 @@ fn show_fatal_error(msg: &str) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let _ = dotenvy::dotenv();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let env_path = std::path::Path::new(manifest_dir).join("..").join(".env");
+    match dotenvy::from_path(&env_path) {
+        Ok(_) => log::info!("loaded .env from {}", env_path.display()),
+        Err(e) => {
+            log::warn!("no .env at {}: {e}", env_path.display());
+            let _ = dotenvy::dotenv();
+        }
+    }
     let _ = env_logger::try_init();
     if let Err(e) = db::init() {
         eprintln!("Failed to initialize database: {e}");
@@ -1950,6 +2024,7 @@ pub fn run() {
             search_emails,
             reindex_account,
             mark_read,
+            mark_all_read,
             archive_email,
             delete_email,
             send_email,

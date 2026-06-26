@@ -53,6 +53,11 @@ export type AiPanelLabels = {
   analyzing: string;
   thinkingStatus: string;
   writingStatus: string;
+  forwardSummary: string;
+  sendAsNew: string;
+  replyWithSummary: string;
+  copy: string;
+  copied: string;
 };
 
 const PANEL_LABELS: Record<AiOutputLanguage, AiPanelLabels> = {
@@ -63,6 +68,11 @@ const PANEL_LABELS: Record<AiOutputLanguage, AiPanelLabels> = {
     analyzing: "Thread wird analysiert…",
     thinkingStatus: "Denkt nach…",
     writingStatus: "Schreibt…",
+    forwardSummary: "Zusammenfassung weiterleiten",
+    sendAsNew: "Als neue E-Mail",
+    replyWithSummary: "Antwort mit Zusammenfassung",
+    copy: "Kopieren",
+    copied: "Kopiert!",
   },
   en: {
     title: "AI Summary",
@@ -71,6 +81,11 @@ const PANEL_LABELS: Record<AiOutputLanguage, AiPanelLabels> = {
     analyzing: "Analyzing thread…",
     thinkingStatus: "Thinking…",
     writingStatus: "Writing…",
+    forwardSummary: "Forward summary",
+    sendAsNew: "Send as new",
+    replyWithSummary: "Reply with summary",
+    copy: "Copy",
+    copied: "Copied!",
   },
   no: {
     title: "AI-oppsummering",
@@ -79,6 +94,11 @@ const PANEL_LABELS: Record<AiOutputLanguage, AiPanelLabels> = {
     analyzing: "Analyserer tråd…",
     thinkingStatus: "Tenker…",
     writingStatus: "Skriver…",
+    forwardSummary: "Videresend oppsummering",
+    sendAsNew: "Send som ny",
+    replyWithSummary: "Svar med oppsummering",
+    copy: "Kopier",
+    copied: "Kopiert!",
   },
 };
 

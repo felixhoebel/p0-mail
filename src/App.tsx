@@ -123,7 +123,7 @@ function App() {
       <main className="flex-1 overflow-hidden">
         <div className={onInbox ? "h-full" : "hidden"}>
           <ErrorBoundary fallbackLabel="Couldn't display this email.">
-            <InboxPage />
+            <InboxPage active={onInbox} />
           </ErrorBoundary>
         </div>
         {!onInbox && (
