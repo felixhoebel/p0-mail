@@ -24,6 +24,16 @@ const POLL_JITTER_SECS: i64 = 10;
 const POLL_BACKOFF_SECS: u64 = 300;
 const SYNC_TIMEOUT_SECS: u64 = 120;
 
+async fn run_db<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("DB task panicked: {}", e))?
+}
+
 fn jittered_interval(base: u64) -> u64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -131,70 +141,76 @@ fn validate_imap_params(params: &ImapAccountParams) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn list_accounts() -> Result<Vec<models::Account>, String> {
-    let conn = db::get()?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, provider_type, display_name, email_address, \
-             imap_host, imap_port, imap_encryption, \
-             smtp_host, smtp_port, smtp_encryption, \
-             last_seen_uid, created_at, sync_error, sync_error_at FROM accounts",
-        )
-        .map_err(|e| e.to_string())?;
-    let accounts = stmt
-        .query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let provider_type: String = row.get(1)?;
-            let oauth = provider_type == "gmail_oauth" || provider_type == "microsoft_oauth";
-            Ok(models::Account {
-                id,
-                provider_type,
-                display_name: row.get(2)?,
-                email_address: row.get(3)?,
-                imap_host: row.get(4)?,
-                imap_port: row.get(5)?,
-                imap_encryption: row.get(6)?,
-                smtp_host: row.get(7)?,
-                smtp_port: row.get(8)?,
-                smtp_encryption: row.get(9)?,
-                last_seen_uid: row.get(10)?,
-                created_at: row.get(11)?,
-                needs_reauth: oauth && !secure::has_access_token(id),
-                sync_error: row.get(12)?,
-                sync_error_at: row.get(13)?,
+async fn list_accounts() -> Result<Vec<models::Account>, String> {
+    run_db(|| {
+        let conn = db::get()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, provider_type, display_name, email_address, \
+                 imap_host, imap_port, imap_encryption, \
+                 smtp_host, smtp_port, smtp_encryption, \
+                 last_seen_uid, created_at, sync_error, sync_error_at FROM accounts",
+            )
+            .map_err(|e| e.to_string())?;
+        let accounts = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let provider_type: String = row.get(1)?;
+                let oauth = provider_type == "gmail_oauth" || provider_type == "microsoft_oauth";
+                Ok(models::Account {
+                    id,
+                    provider_type,
+                    display_name: row.get(2)?,
+                    email_address: row.get(3)?,
+                    imap_host: row.get(4)?,
+                    imap_port: row.get(5)?,
+                    imap_encryption: row.get(6)?,
+                    smtp_host: row.get(7)?,
+                    smtp_port: row.get(8)?,
+                    smtp_encryption: row.get(9)?,
+                    last_seen_uid: row.get(10)?,
+                    created_at: row.get(11)?,
+                    needs_reauth: oauth && !secure::has_access_token(id),
+                    sync_error: row.get(12)?,
+                    sync_error_at: row.get(13)?,
+                })
             })
-        })
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
-        .collect();
-    Ok(accounts)
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
+            .collect();
+        Ok(accounts)
+    })
+    .await
 }
 
 #[tauri::command]
-fn list_folders(account_id: i64) -> Result<Vec<models::Folder>, String> {
-    let conn = db::get()?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, account_id, name, imap_name, special_use \
-             FROM folders WHERE account_id = ?1 ORDER BY \
-             CASE special_use WHEN 'inbox' THEN 0 WHEN 'sent' THEN 1 WHEN 'drafts' THEN 2 \
-             WHEN 'spam' THEN 3 WHEN 'trash' THEN 4 WHEN 'archive' THEN 5 ELSE 6 END, name",
-        )
-        .map_err(|e| e.to_string())?;
-    let folders = stmt
-        .query_map(rusqlite::params![account_id], |row| {
-            Ok(models::Folder {
-                id: row.get(0)?,
-                account_id: row.get(1)?,
-                name: row.get(2)?,
-                imap_name: row.get(3)?,
-                special_use: row.get(4)?,
+async fn list_folders(account_id: i64) -> Result<Vec<models::Folder>, String> {
+    run_db(move || {
+        let conn = db::get()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, account_id, name, imap_name, special_use \
+                 FROM folders WHERE account_id = ?1 ORDER BY \
+                 CASE special_use WHEN 'inbox' THEN 0 WHEN 'sent' THEN 1 WHEN 'drafts' THEN 2 \
+                 WHEN 'spam' THEN 3 WHEN 'trash' THEN 4 WHEN 'archive' THEN 5 ELSE 6 END, name",
+            )
+            .map_err(|e| e.to_string())?;
+        let folders = stmt
+            .query_map(rusqlite::params![account_id], |row| {
+                Ok(models::Folder {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    name: row.get(2)?,
+                    imap_name: row.get(3)?,
+                    special_use: row.get(4)?,
+                })
             })
-        })
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
-        .collect();
-    Ok(folders)
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
+            .collect();
+        Ok(folders)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -289,49 +305,52 @@ async fn add_oauth_account(
 }
 
 #[tauri::command]
-fn add_imap_account(params: ImapAccountParams) -> Result<models::Account, String> {
+async fn add_imap_account(params: ImapAccountParams) -> Result<models::Account, String> {
     validate_imap_params(&params)?;
 
-    let conn = db::get()?;
-    conn.execute(
-        "INSERT INTO accounts \
-         (provider_type, display_name, email_address, \
-          imap_host, imap_port, imap_encryption, \
-          smtp_host, smtp_port, smtp_encryption) \
-         VALUES ('imap', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![
-            params.display_name,
-            params.email_address,
-            params.imap_host,
-            params.imap_port,
-            params.imap_encryption,
-            params.smtp_host,
-            params.smtp_port,
-            params.smtp_encryption,
-        ],
-    )
-    .map_err(|e| e.to_string())?;
+    run_db(move || {
+        let conn = db::get()?;
+        conn.execute(
+            "INSERT INTO accounts \
+             (provider_type, display_name, email_address, \
+              imap_host, imap_port, imap_encryption, \
+              smtp_host, smtp_port, smtp_encryption) \
+             VALUES ('imap', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                params.display_name,
+                params.email_address,
+                params.imap_host,
+                params.imap_port,
+                params.imap_encryption,
+                params.smtp_host,
+                params.smtp_port,
+                params.smtp_encryption,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
 
-    let account_id = conn.last_insert_rowid();
-    secure::store_imap_password(account_id, &params.password)?;
+        let account_id = conn.last_insert_rowid();
+        secure::store_imap_password(account_id, &params.password)?;
 
-    Ok(models::Account {
-        id: account_id,
-        provider_type: "imap".to_string(),
-        display_name: params.display_name,
-        email_address: params.email_address,
-        imap_host: Some(params.imap_host),
-        imap_port: Some(params.imap_port),
-        imap_encryption: Some(params.imap_encryption),
-        smtp_host: Some(params.smtp_host),
-        smtp_port: Some(params.smtp_port),
-        smtp_encryption: Some(params.smtp_encryption),
-        last_seen_uid: 0,
-        created_at: chrono::Utc::now().timestamp(),
-        needs_reauth: false,
-        sync_error: None,
-        sync_error_at: None,
+        Ok(models::Account {
+            id: account_id,
+            provider_type: "imap".to_string(),
+            display_name: params.display_name,
+            email_address: params.email_address,
+            imap_host: Some(params.imap_host),
+            imap_port: Some(params.imap_port),
+            imap_encryption: Some(params.imap_encryption),
+            smtp_host: Some(params.smtp_host),
+            smtp_port: Some(params.smtp_port),
+            smtp_encryption: Some(params.smtp_encryption),
+            last_seen_uid: 0,
+            created_at: chrono::Utc::now().timestamp(),
+            needs_reauth: false,
+            sync_error: None,
+            sync_error_at: None,
+        })
     })
+    .await
 }
 
 #[tauri::command]
@@ -426,44 +445,47 @@ async fn reauth_oauth_account(
 }
 
 #[tauri::command]
-fn remove_account(account_id: i64) -> Result<(), String> {
-    let conn = db::get()?;
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    tx.execute(
-        "DELETE FROM emails WHERE account_id = ?1",
-        rusqlite::params![account_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
-        "DELETE FROM threads WHERE account_id = ?1",
-        rusqlite::params![account_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
-        "DELETE FROM folders WHERE account_id = ?1",
-        rusqlite::params![account_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
-        "DELETE FROM folder_sync_state WHERE account_id = ?1",
-        rusqlite::params![account_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
-        "DELETE FROM send_queue WHERE account_id = ?1",
-        rusqlite::params![account_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
-        "DELETE FROM accounts WHERE id = ?1",
-        rusqlite::params![account_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
-    let _ = secure::delete_secret(&format!("account_{}_access_token", account_id));
-    let _ = secure::delete_secret(&format!("account_{}_refresh_token", account_id));
-    let _ = secure::delete_secret(&format!("account_{}_imap_password", account_id));
-    Ok(())
+async fn remove_account(account_id: i64) -> Result<(), String> {
+    run_db(move || {
+        let conn = db::get()?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM emails WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM threads WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM folders WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM folder_sync_state WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM send_queue WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        let _ = secure::delete_secret(&format!("account_{}_access_token", account_id));
+        let _ = secure::delete_secret(&format!("account_{}_refresh_token", account_id));
+        let _ = secure::delete_secret(&format!("account_{}_imap_password", account_id));
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -483,175 +505,193 @@ async fn trigger_sync(account_id: Option<i64>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_account_sync_enabled(account_id: i64, enabled: bool) -> Result<(), String> {
-    let conn = db::get()?;
-    conn.execute(
-        "UPDATE accounts SET sync_enabled = ?1 WHERE id = ?2",
-        rusqlite::params![enabled as i64, account_id],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+async fn set_account_sync_enabled(account_id: i64, enabled: bool) -> Result<(), String> {
+    run_db(move || {
+        let conn = db::get()?;
+        conn.execute(
+            "UPDATE accounts SET sync_enabled = ?1 WHERE id = ?2",
+            rusqlite::params![enabled as i64, account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-fn list_threads(
+async fn list_threads(
     account_id: Option<i64>,
     folder: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<Vec<models::Thread>, String> {
-    let conn = db::get()?;
-    let limit = limit.unwrap_or(100);
-    let offset = offset.unwrap_or(0);
+    run_db(move || {
+        let conn = db::get()?;
+        let limit = limit.unwrap_or(100);
+        let offset = offset.unwrap_or(0);
 
-    let (sql, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match (account_id, folder) {
-        (Some(aid), Some(f)) => (
-            "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
-             FROM threads t WHERE t.account_id = ?1 \
-             AND EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id AND e.folder = ?2) \
-             ORDER BY t.latest_date DESC LIMIT ?3 OFFSET ?4".to_string(),
-            vec![Box::new(aid), Box::new(f), Box::new(limit), Box::new(offset)],
-        ),
-        (Some(aid), None) => (
-            "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
-             FROM threads t WHERE t.account_id = ?1 \
-             AND EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id) \
-             ORDER BY t.latest_date DESC LIMIT ?2 OFFSET ?3".to_string(),
-            vec![Box::new(aid), Box::new(limit), Box::new(offset)],
-        ),
-        (None, Some(f)) => (
-            "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
-             FROM threads t \
-             WHERE EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id AND e.folder = ?1) \
-             ORDER BY t.latest_date DESC LIMIT ?2 OFFSET ?3".to_string(),
-            vec![Box::new(f), Box::new(limit), Box::new(offset)],
-        ),
-        (None, None) => (
-            "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
-             FROM threads t \
-             WHERE EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id) \
-             ORDER BY t.latest_date DESC LIMIT ?1 OFFSET ?2".to_string(),
-            vec![Box::new(limit), Box::new(offset)],
-        ),
-    };
+        let (sql, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match (account_id, folder) {
+            (Some(aid), Some(f)) => (
+                "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
+                 FROM threads t WHERE t.account_id = ?1 \
+                 AND EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id AND e.folder = ?2) \
+                 ORDER BY t.latest_date DESC LIMIT ?3 OFFSET ?4".to_string(),
+                vec![Box::new(aid), Box::new(f), Box::new(limit), Box::new(offset)],
+            ),
+            (Some(aid), None) => (
+                "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
+                 FROM threads t WHERE t.account_id = ?1 \
+                 AND EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id) \
+                 ORDER BY t.latest_date DESC LIMIT ?2 OFFSET ?3".to_string(),
+                vec![Box::new(aid), Box::new(limit), Box::new(offset)],
+            ),
+            (None, Some(f)) => (
+                "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
+                 FROM threads t \
+                 WHERE EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id AND e.folder = ?1) \
+                 ORDER BY t.latest_date DESC LIMIT ?2 OFFSET ?3".to_string(),
+                vec![Box::new(f), Box::new(limit), Box::new(offset)],
+            ),
+            (None, None) => (
+                "SELECT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
+                 FROM threads t \
+                 WHERE EXISTS (SELECT 1 FROM emails e WHERE e.thread_id = t.id) \
+                 ORDER BY t.latest_date DESC LIMIT ?1 OFFSET ?2".to_string(),
+                vec![Box::new(limit), Box::new(offset)],
+            ),
+        };
 
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let threads: Vec<models::Thread> = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(models::Thread {
-                id: row.get(0)?,
-                account_id: row.get(1)?,
-                subject: decode_subject(row.get(2)?),
-                latest_date: row.get(3)?,
-                message_count: row.get(4)?,
-                is_read: row.get::<_, i64>(5)? != 0,
-                is_flagged: row.get::<_, i64>(6)? != 0,
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let threads: Vec<models::Thread> = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok(models::Thread {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    subject: decode_subject(row.get(2)?),
+                    latest_date: row.get(3)?,
+                    message_count: row.get(4)?,
+                    is_read: row.get::<_, i64>(5)? != 0,
+                    is_flagged: row.get::<_, i64>(6)? != 0,
+                })
             })
-        })
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
-        .collect();
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
+            .collect();
 
-    Ok(threads)
+        Ok(threads)
+    })
+    .await
 }
 
 #[tauri::command]
-fn get_emails(thread_id: i64) -> Result<Vec<models::Email>, String> {
-    let conn = db::get()?;
-    let mut stmt = conn
-        .prepare(
+async fn get_emails(thread_id: i64) -> Result<Vec<models::Email>, String> {
+    run_db(move || {
+        let conn = db::get()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, thread_id, account_id, imap_uid, message_id, \
+                 in_reply_to, \"references\", subject, from_json, to_json, \
+                 cc_json, bcc_json, date_rfc2822, received_at, body_text, \
+                 body_html, is_read, folder, attachments_meta, labels \
+                 FROM emails WHERE thread_id = ?1 ORDER BY received_at ASC",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let emails: Vec<models::Email> = stmt
+            .query_map(rusqlite::params![thread_id], map_email_row)
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
+            .collect();
+
+        Ok(emails)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn get_email(email_id: i64) -> Result<models::Email, String> {
+    run_db(move || {
+        let conn = db::get()?;
+        conn.query_row(
             "SELECT id, thread_id, account_id, imap_uid, message_id, \
              in_reply_to, \"references\", subject, from_json, to_json, \
              cc_json, bcc_json, date_rfc2822, received_at, body_text, \
              body_html, is_read, folder, attachments_meta, labels \
-             FROM emails WHERE thread_id = ?1 ORDER BY received_at ASC",
+             FROM emails WHERE id = ?1",
+            rusqlite::params![email_id],
+            map_email_row,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn search_emails(query: String) -> Result<Vec<models::Thread>, String> {
+    run_db(move || {
+        let service = search::SearchService::new();
+        let email_ids = service.search(&query, 50)?;
+        if email_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let conn = db::get()?;
+        let placeholders: Vec<String> = email_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+        let sql = format!(
+            "SELECT DISTINCT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
+             FROM threads t \
+             JOIN emails e ON e.thread_id = t.id \
+             WHERE e.id IN ({}) \
+             ORDER BY t.latest_date DESC",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = email_ids
+            .iter()
+            .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let threads: Vec<models::Thread> = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok(models::Thread {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    subject: decode_subject(row.get(2)?),
+                    latest_date: row.get(3)?,
+                    message_count: row.get(4)?,
+                    is_read: row.get::<_, i64>(5)? != 0,
+                    is_flagged: row.get::<_, i64>(6)? != 0,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
+            .collect();
+        Ok(threads)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn reindex_account(account_id: i64) -> Result<(), String> {
+    run_db(move || {
+        let conn = db::get()?;
+        conn.execute(
+            "INSERT INTO emails_fts(emails_fts, rowid, subject, from_address, to_address, body_text, body_html_stripped) \
+             SELECT 'delete', id, subject, from_json, to_json, COALESCE(body_text, ''), strip_html(COALESCE(body_html, body_text, '')) \
+             FROM emails WHERE account_id = ?1",
+            rusqlite::params![account_id],
         )
         .map_err(|e| e.to_string())?;
-
-    let emails: Vec<models::Email> = stmt
-        .query_map(rusqlite::params![thread_id], map_email_row)
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
-        .collect();
-
-    Ok(emails)
-}
-
-#[tauri::command]
-fn get_email(email_id: i64) -> Result<models::Email, String> {
-    let conn = db::get()?;
-    conn.query_row(
-        "SELECT id, thread_id, account_id, imap_uid, message_id, \
-         in_reply_to, \"references\", subject, from_json, to_json, \
-         cc_json, bcc_json, date_rfc2822, received_at, body_text, \
-         body_html, is_read, folder, attachments_meta, labels \
-         FROM emails WHERE id = ?1",
-        rusqlite::params![email_id],
-        map_email_row,
-    )
-    .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn search_emails(query: String) -> Result<Vec<models::Thread>, String> {
-    let service = search::SearchService::new();
-    let email_ids = service.search(&query, 50)?;
-    if email_ids.is_empty() {
-        return Ok(vec![]);
-    }
-    let conn = db::get()?;
-    let placeholders: Vec<String> = email_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
-    let sql = format!(
-        "SELECT DISTINCT t.id, t.account_id, t.subject, t.latest_date, t.message_count, t.is_read, t.is_flagged \
-         FROM threads t \
-         JOIN emails e ON e.thread_id = t.id \
-         WHERE e.id IN ({}) \
-         ORDER BY t.latest_date DESC",
-        placeholders.join(",")
-    );
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let params: Vec<Box<dyn rusqlite::types::ToSql>> = email_ids
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
-        .collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let threads: Vec<models::Thread> = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(models::Thread {
-                id: row.get(0)?,
-                account_id: row.get(1)?,
-                subject: decode_subject(row.get(2)?),
-                latest_date: row.get(3)?,
-                message_count: row.get(4)?,
-                is_read: row.get::<_, i64>(5)? != 0,
-                is_flagged: row.get::<_, i64>(6)? != 0,
-            })
-        })
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
-        .collect();
-    Ok(threads)
-}
-
-#[tauri::command]
-fn reindex_account(account_id: i64) -> Result<(), String> {
-    let conn = db::get()?;
-    conn.execute(
-        "INSERT INTO emails_fts(emails_fts, rowid, subject, from_address, to_address, body_text, body_html_stripped) \
-         SELECT 'delete', id, subject, from_json, to_json, COALESCE(body_text, ''), strip_html(COALESCE(body_html, body_text, '')) \
-         FROM emails WHERE account_id = ?1",
-        rusqlite::params![account_id],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT INTO emails_fts(rowid, subject, from_address, to_address, body_text, body_html_stripped) \
-         SELECT id, subject, from_json, to_json, COALESCE(body_text, ''), strip_html(COALESCE(body_html, body_text, '')) \
-         FROM emails WHERE account_id = ?1",
-        rusqlite::params![account_id],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+        conn.execute(
+            "INSERT INTO emails_fts(rowid, subject, from_address, to_address, body_text, body_html_stripped) \
+             SELECT id, subject, from_json, to_json, COALESCE(body_text, ''), strip_html(COALESCE(body_html, body_text, '')) \
+             FROM emails WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -776,7 +816,7 @@ async fn archive_email(email_id: i64) -> Result<(), String> {
     }
 
     if let Some(tid) = ctx.thread_id {
-        cleanup_empty_threads(tid)?;
+        let _ = tokio::task::spawn_blocking(move || cleanup_empty_threads(tid)).await;
     }
 
     imap_client::logout_session(&mut session).await;
@@ -825,7 +865,7 @@ async fn delete_email(email_id: i64) -> Result<(), String> {
     }
 
     if let Some(tid) = ctx.thread_id {
-        cleanup_empty_threads(tid)?;
+        let _ = tokio::task::spawn_blocking(move || cleanup_empty_threads(tid)).await;
     }
 
     imap_client::logout_session(&mut session).await;
@@ -881,18 +921,28 @@ async fn send_email(
         )
         .await?;
 
-    insert_sent_copy(
-        account_id,
-        &to,
-        cc.as_deref(),
-        bcc.as_deref(),
-        &subject,
-        &body_html,
-        &body_text,
-        in_reply_to.as_deref(),
-        refs_for_sent.as_deref(),
-    )
-    .ok();
+    let account_id_for_sent = account_id;
+    let to_for_sent = to.clone();
+    let cc_for_sent = cc.clone();
+    let bcc_for_sent = bcc.clone();
+    let subject_for_sent = subject.clone();
+    let body_html_for_sent = body_html.clone();
+    let body_text_for_sent = body_text.clone();
+    let in_reply_to_for_sent = in_reply_to.clone();
+    let refs_for_sent_copy = refs_for_sent.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        insert_sent_copy(
+            account_id_for_sent,
+            &to_for_sent,
+            cc_for_sent.as_deref(),
+            bcc_for_sent.as_deref(),
+            &subject_for_sent,
+            &body_html_for_sent,
+            &body_text_for_sent,
+            in_reply_to_for_sent.as_deref(),
+            refs_for_sent_copy.as_deref(),
+        )
+    }).await;
 
     let _ = tokio::task::spawn_blocking(move || {
         let threading = threading::ThreadingService::new();
@@ -1015,45 +1065,48 @@ fn insert_sent_copy(
 }
 
 #[tauri::command]
-fn get_send_queue() -> Result<Vec<models::SendQueueItem>, String> {
-    let conn = db::get()?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
-             body_html, body_text, attachments_meta, status, retry_count, \
-             created_at, sent_at FROM send_queue ORDER BY created_at DESC",
-        )
-        .map_err(|e| e.to_string())?;
-    let items: Vec<models::SendQueueItem> = stmt
-        .query_map([], |row| {
-            let to_str: String = row.get(2)?;
-            let cc_str: Option<String> = row.get(3)?;
-            let bcc_str: Option<String> = row.get(4)?;
-            let att_str: Option<String> = row.get(8)?;
-            Ok(models::SendQueueItem {
-                id: row.get(0)?,
-                account_id: row.get(1)?,
-                to_field: serde_json::from_str(&to_str).unwrap_or_default(),
-                cc_field: cc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
-                bcc_field: bcc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
-                subject: row.get(5)?,
-                body_html: row.get(6)?,
-                body_text: row.get(7)?,
-                attachments_meta: att_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
-                status: row.get(9)?,
-                retry_count: row.get(10)?,
-                created_at: row.get(11)?,
-                sent_at: row.get(12)?,
+async fn get_send_queue() -> Result<Vec<models::SendQueueItem>, String> {
+    run_db(|| {
+        let conn = db::get()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
+                 body_html, body_text, attachments_meta, status, retry_count, \
+                 created_at, sent_at FROM send_queue ORDER BY created_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let items: Vec<models::SendQueueItem> = stmt
+            .query_map([], |row| {
+                let to_str: String = row.get(2)?;
+                let cc_str: Option<String> = row.get(3)?;
+                let bcc_str: Option<String> = row.get(4)?;
+                let att_str: Option<String> = row.get(8)?;
+                Ok(models::SendQueueItem {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    to_field: serde_json::from_str(&to_str).unwrap_or_default(),
+                    cc_field: cc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+                    bcc_field: bcc_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+                    subject: row.get(5)?,
+                    body_html: row.get(6)?,
+                    body_text: row.get(7)?,
+                    attachments_meta: att_str.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+                    status: row.get(9)?,
+                    retry_count: row.get(10)?,
+                    created_at: row.get(11)?,
+                    sent_at: row.get(12)?,
+                })
             })
-        })
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
-        .collect();
-    Ok(items)
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok())
+            .collect();
+        Ok(items)
+    })
+    .await
 }
 
 #[tauri::command]
-fn save_draft(
+async fn save_draft(
     account_id: i64,
     to: String,
     cc: Option<String>,
@@ -1063,70 +1116,79 @@ fn save_draft(
     body_text: String,
     draft_id: Option<i64>,
 ) -> Result<i64, String> {
-    let now = chrono::Utc::now().timestamp();
-    let conn = db::get()?;
+    run_db(move || {
+        let now = chrono::Utc::now().timestamp();
+        let conn = db::get()?;
 
-    if let Some(id) = draft_id {
-        let updated = conn.execute(
-            "UPDATE send_queue SET to_json = ?1, cc_json = ?2, bcc_json = ?3, \
-             subject = ?4, body_html = ?5, body_text = ?6, updated_at = ?7 \
-             WHERE id = ?8 AND status = 'draft'",
-            rusqlite::params![to, cc, bcc, subject, body_html, body_text, now, id],
-        )
-        .map_err(|e| format!("Failed to update draft: {}", e))?;
+        if let Some(id) = draft_id {
+            let updated = conn.execute(
+                "UPDATE send_queue SET to_json = ?1, cc_json = ?2, bcc_json = ?3, \
+                 subject = ?4, body_html = ?5, body_text = ?6, updated_at = ?7 \
+                 WHERE id = ?8 AND status = 'draft'",
+                rusqlite::params![to, cc, bcc, subject, body_html, body_text, now, id],
+            )
+            .map_err(|e| format!("Failed to update draft: {}", e))?;
 
-        if updated > 0 {
-            return Ok(id);
+            if updated > 0 {
+                return Ok(id);
+            }
         }
-    }
 
-    conn.execute(
-        "INSERT INTO send_queue \
-         (account_id, to_json, cc_json, bcc_json, subject, body_html, body_text, \
-          status, retry_count, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'draft', 0, ?8, ?8)",
-        rusqlite::params![account_id, to, cc, bcc, subject, body_html, body_text, now],
-    )
-    .map_err(|e| format!("Failed to insert draft: {}", e))?;
+        conn.execute(
+            "INSERT INTO send_queue \
+             (account_id, to_json, cc_json, bcc_json, subject, body_html, body_text, \
+              status, retry_count, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'draft', 0, ?8, ?8)",
+            rusqlite::params![account_id, to, cc, bcc, subject, body_html, body_text, now],
+        )
+        .map_err(|e| format!("Failed to insert draft: {}", e))?;
 
-    Ok(conn.last_insert_rowid())
+        Ok(conn.last_insert_rowid())
+    })
+    .await
 }
 
 #[tauri::command]
-fn list_drafts(account_id: Option<i64>) -> Result<Vec<models::SendQueueItem>, String> {
-    let conn = db::get()?;
-    let sql = match account_id {
-        Some(_) => "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
-                    body_html, body_text, attachments_meta, status, retry_count, \
-                    created_at, sent_at FROM send_queue WHERE status = 'draft' \
-                    AND account_id = ?1 ORDER BY updated_at DESC",
-        None => "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
-                 body_html, body_text, attachments_meta, status, retry_count, \
-                 created_at, sent_at FROM send_queue WHERE status = 'draft' \
-                 ORDER BY updated_at DESC",
-    };
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-    let rows = match account_id {
-        Some(aid) => stmt
-            .query_map(rusqlite::params![aid], map_send_queue_row)
-            .map_err(|e| e.to_string())?,
-        None => stmt
-            .query_map([], map_send_queue_row)
-            .map_err(|e| e.to_string())?,
-    };
-    let items: Vec<models::SendQueueItem> = rows.filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok()).collect();
-    Ok(items)
+async fn list_drafts(account_id: Option<i64>) -> Result<Vec<models::SendQueueItem>, String> {
+    run_db(move || {
+        let conn = db::get()?;
+        let sql = match account_id {
+            Some(_) => "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
+                        body_html, body_text, attachments_meta, status, retry_count, \
+                        created_at, sent_at FROM send_queue WHERE status = 'draft' \
+                        AND account_id = ?1 ORDER BY updated_at DESC",
+            None => "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
+                     body_html, body_text, attachments_meta, status, retry_count, \
+                     created_at, sent_at FROM send_queue WHERE status = 'draft' \
+                     ORDER BY updated_at DESC",
+        };
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = match account_id {
+            Some(aid) => stmt
+                .query_map(rusqlite::params![aid], map_send_queue_row)
+                .map_err(|e| e.to_string())?,
+            None => stmt
+                .query_map([], map_send_queue_row)
+                .map_err(|e| e.to_string())?,
+        };
+        let items: Vec<models::SendQueueItem> = rows.filter_map(|r| r.map_err(|e| log::warn!("row map: {e}")).ok()).collect();
+        Ok(items)
+    })
+    .await
 }
 
 #[tauri::command]
-fn delete_draft(draft_id: i64) -> Result<(), String> {
-    let conn = db::get()?;
-    conn.execute(
-        "DELETE FROM send_queue WHERE id = ?1 AND status = 'draft'",
-        rusqlite::params![draft_id],
-    )
-    .map_err(|e| format!("Failed to delete draft: {}", e))?;
-    Ok(())
+async fn delete_draft(draft_id: i64) -> Result<(), String> {
+    run_db(move || {
+        let conn = db::get()?;
+        conn.execute(
+            "DELETE FROM send_queue WHERE id = ?1 AND status = 'draft'",
+            rusqlite::params![draft_id],
+        )
+        .map_err(|e| format!("Failed to delete draft: {}", e))?;
+        Ok(())
+    })
+    .await
 }
 
 fn map_send_queue_row(row: &rusqlite::Row) -> rusqlite::Result<models::SendQueueItem> {
@@ -1221,74 +1283,80 @@ async fn retry_send_queue_item(queue_id: i64) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_ai_config() -> Result<Option<models::AiConfig>, String> {
-    let conn = db::get()?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT key, value FROM app_settings \
-             WHERE key IN ('ai_base_url','ai_model','ai_default_tone','ai_output_language','ai_custom_instructions')",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.map_err(|e| log::warn!("ai_config row map: {e}")).ok())
-        .collect();
+async fn get_ai_config() -> Result<Option<models::AiConfig>, String> {
+    run_db(|| {
+        let conn = db::get()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT key, value FROM app_settings \
+                 WHERE key IN ('ai_base_url','ai_model','ai_default_tone','ai_output_language','ai_custom_instructions')",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.map_err(|e| log::warn!("ai_config row map: {e}")).ok())
+            .collect();
 
-    let get = |k: &str| -> String {
-        rows.iter()
-            .find(|(key, _)| key == k)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default()
-    };
-    let base_url = get("ai_base_url");
+        let get = |k: &str| -> String {
+            rows.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        let base_url = get("ai_base_url");
 
-    if base_url.is_empty() {
-        return Ok(None);
-    }
-    let api_key = secure::get_ai_api_key().unwrap_or_default();
-    Ok(Some(models::AiConfig {
-        base_url,
-        api_key,
-        model: get("ai_model"),
-        default_tone: {
-            let t = get("ai_default_tone");
-            if t.is_empty() { "Professional".to_string() } else { t }
-        },
-        output_language: {
-            let l = get("ai_output_language");
-            if l.is_empty() { "en".to_string() } else { l }
-        },
-        custom_instructions: get("ai_custom_instructions"),
-    }))
+        if base_url.is_empty() {
+            return Ok(None);
+        }
+        let api_key = secure::get_ai_api_key().unwrap_or_default();
+        Ok(Some(models::AiConfig {
+            base_url,
+            api_key,
+            model: get("ai_model"),
+            default_tone: {
+                let t = get("ai_default_tone");
+                if t.is_empty() { "Professional".to_string() } else { t }
+            },
+            output_language: {
+                let l = get("ai_output_language");
+                if l.is_empty() { "en".to_string() } else { l }
+            },
+            custom_instructions: get("ai_custom_instructions"),
+        }))
+    })
+    .await
 }
 
 #[tauri::command]
-fn set_ai_config(config: models::AiConfig) -> Result<(), String> {
-    let conn = db::get()?;
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    let pairs: [(&str, &str); 5] = [
-        ("ai_base_url", &config.base_url),
-        ("ai_model", &config.model),
-        ("ai_default_tone", &config.default_tone),
-        ("ai_output_language", &config.output_language),
-        ("ai_custom_instructions", &config.custom_instructions),
-    ];
-    for (key, value) in pairs {
-        tx.execute(
-            "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?1, ?2)",
-            rusqlite::params![key, value],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    tx.commit().map_err(|e| e.to_string())?;
-    secure::store_ai_api_key(&config.api_key)?;
-    Ok(())
+async fn set_ai_config(config: models::AiConfig) -> Result<(), String> {
+    run_db(move || {
+        let conn = db::get()?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let pairs: [(&str, &str); 5] = [
+            ("ai_base_url", &config.base_url),
+            ("ai_model", &config.model),
+            ("ai_default_tone", &config.default_tone),
+            ("ai_output_language", &config.output_language),
+            ("ai_custom_instructions", &config.custom_instructions),
+        ];
+        for (key, value) in pairs {
+            tx.execute(
+                "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        secure::store_ai_api_key(&config.api_key)?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 async fn validate_ai_endpoint() -> Result<bool, String> {
-    let config = get_ai_config()?;
+    let config = get_ai_config().await?;
     match config {
         Some(c) => {
             let service = ai::AiService::new();
@@ -1300,7 +1368,7 @@ async fn validate_ai_endpoint() -> Result<bool, String> {
 
 #[tauri::command]
 async fn list_ai_models() -> Result<Vec<String>, String> {
-    let config = get_ai_config()?;
+    let config = get_ai_config().await?;
     match config {
         Some(c) => {
             let service = ai::AiService::new();
@@ -1464,7 +1532,9 @@ async fn fetch_email_body(email_id: i64) -> Result<(), String> {
 
     let raw = imap_client::fetch_uid_message_raw(&mut session, uid as u32).await?;
     imap_client::logout_session(&mut session).await;
-    email_parse::apply_raw_message(email_id, &raw)?;
+    tokio::task::spawn_blocking(move || email_parse::apply_raw_message(email_id, &raw))
+        .await
+        .map_err(|e| format!("Parse task panicked: {}", e))??;
     Ok(())
 }
 
@@ -1562,7 +1632,12 @@ async fn fetch_thread_bodies(thread_id: i64) -> Result<i64, String> {
 
         match imap_client::fetch_uid_message_raw(&mut session, uid as u32).await {
             Ok(raw) => {
-                if email_parse::apply_raw_message(*email_id, &raw).is_ok() {
+                let eid = *email_id;
+                if tokio::task::spawn_blocking(move || email_parse::apply_raw_message(eid, &raw))
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false)
+                {
                     fetched += 1;
                 }
             }
@@ -1754,7 +1829,12 @@ async fn fetch_recent_bodies(account_id: i64, limit: i64) -> Result<i64, String>
 
         match imap_client::fetch_uid_message_raw(&mut session, *uid as u32).await {
             Ok(raw) => {
-                if email_parse::apply_raw_message(*email_id, &raw).is_ok() {
+                let eid = *email_id;
+                if tokio::task::spawn_blocking(move || email_parse::apply_raw_message(eid, &raw))
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false)
+                {
                     fetched += 1;
                 }
             }
