@@ -2,7 +2,7 @@
 
 > **Purpose.** Self-contained workstream specs for autonomous agents. Each task lists what to build, which files to touch, dependencies, and how to verify. Pick a phase → pick a task → execute end-to-end.
 
-**Current state:** Phase 1-3 complete (DB encrypted at rest, background polling, new-mail notifications, FTS5 search, CI signing, OAuth + IMAP + AI streaming, attachments, folders, drafts, reply-all/forward, virtualization, error boundary, sync health). Phase 4 in progress: 4.1 Command palette ✅, 4.9 AI summary workflow ✅, 4.2 Undo send ✅, 4.3 Schedule send ✅; remaining (snooze, autocomplete, bundles, per-account settings, live theme). Phase 5 (code-quality refactors: lib.rs/InboxPage god-modules) partially done (5.1-5.3 ✅; 5.4-5.6 pending). An audit found a few latent bugs in "complete" tasks (see 5.2 FTS bug ✅fixed, mark_read swallows IMAP errors, handleArchive/handleDelete swallow backend errors) — these are tracked in Phase 5.
+**Current state:** Phase 1-3 complete (DB encrypted at rest, background polling, new-mail notifications, FTS5 search, CI signing, OAuth + IMAP + AI streaming, attachments, folders, drafts, reply-all/forward, virtualization, error boundary, sync health). Phase 4 in progress: 4.1 Command palette ✅, 4.9 AI summary workflow ✅, 4.2 Undo send ✅, 4.3 Schedule send ✅ (+ draft edit/delete from Outbox); remaining (snooze, autocomplete, bundles, per-account settings, live theme). Phase 5 (code-quality refactors: lib.rs/InboxPage god-modules) partially done (5.1-5.3 ✅; 5.4-5.6 pending). An audit found a few latent bugs in "complete" tasks (see 5.2 FTS bug ✅fixed, mark_read swallows IMAP errors, handleArchive/handleDelete swallow backend errors) — these are tracked in Phase 5.
 
 **Conventions:** Conventional commits (`feat:`, `fix:`, `security:`, `chore:`). No comments unless asked. Rust in `src-tauri/src/`, React in `src/`. Verify with `cargo test` + `npm run build` (CI runs `tsc --noEmit` + build).
 
@@ -277,6 +277,7 @@ Driven by an architecture audit of the two largest files (`lib.rs` 1957 LOC, `In
 - `InboxPage.handleSend`: when `params.sendAt` is set, computes `deferSeconds = (sendAt - now)/1000` and queues via `queueEmail` (skipping the 8s undo window), then shows a fixed-bottom "scheduled for <time> — Cancel" toast (10s). Cancel calls the existing `cancel_send` command (flips `sending`→`draft`, saved to Drafts).
 - `SendQueuePanel` (Outbox): items with `status='sending'` + future `send_after` render as "scheduled" with the formatted time + a per-row Cancel button. The Outbox badge now counts pending + scheduled sends (30s threshold excludes the 8s undo-window items), so scheduled sends remain reachable for cancellation after the toast dismisses.
 - Dedicated "Scheduled" view: a "Scheduled" nav entry in the sidebar (Clock icon + count badge) opens a full-page `ScheduledView` in the reading pane, showing all scheduled sends sorted by send time with recipient, subject, body preview, formatted due time, account, and per-row Cancel. Selecting a thread, folder, account, or Compose resets to inbox view.
+- **Draft management (commit `fb2e9d7`):** Outbox badge now counts drafts (not just pending+scheduled); `ComposeEditor` gains `onDraftSaved` callback so the badge appears within 3s of autosave. Draft + scheduled rows in the Outbox panel and Scheduled view are click-to-edit — reopening a draft restores to/cc/bcc/subject/body and the `draftId` (autosave updates in place, send deletes it — no duplicates); reopening a scheduled send cancels the pending send (→ draft) and pre-fills the schedule time. Draft rows have a trash-icon delete button; `onQueueChange` refreshes the badge immediately after delete/cancel/retry.
 **Files:** `src-tauri/src/commands/models.rs`, `src-tauri/src/lib.rs`, `src/components/email/ComposeEditor.tsx`, `src/pages/InboxPage.tsx`, `src/types/index.ts`.
 **Verify:** `cargo test` (20 passed) + `cargo clippy` (no new warnings) + `npm run build`/`tsc` clean. Manual: Compose → "Send later" → pick a time → toast "scheduled for …" → cancel returns it to Drafts; otherwise the 60s poller sends when due and it lands in Sent.
 **Depends on:** 4.2 (same queue + `send_after` infra).
@@ -321,6 +322,32 @@ Four actions on the summary panel, shown as a button row beneath the summary tex
 - `src-tauri/src/lib.rs` — `stream_draft_reply` Tauri command gains `summary: Option<String>`.
 **Verify:** Generate a summary → each of the 4 buttons works (forward opens compose with summary + quote; send-as-new opens compose with summary only; reply-with-summary drafts a reply that references the summary; copy writes to clipboard). `cargo check` + `npx tsc --noEmit` clean.
 **Depends on:** nothing (builds on existing summarize + compose machinery).
+
+---
+
+## Release Readiness
+
+**Verdict: v1 is shippable now.** All P0 (ship-blockers), P1 (MVP completeness), and P2 (robustness) are complete. The app delivers on its core promise: encrypted-at-rest local mail, background polling, notifications, FTS search, OAuth + IMAP, attachments, folders, drafts, reply-all/forward, undo send, schedule send, command palette, AI summarize/reply, and a virtualized inbox.
+
+### Pre-release fixes (should do before tagging)
+These are latent bugs found in the audit — small, targeted, user-facing correctness:
+- **`mark_read` swallows IMAP errors** — read state can drift out of sync with the server silently (tracked in 5.4).
+- **`handleArchive`/`handleDelete` swallow backend errors** — local state is mutated optimistically even on failure, so a failed archive/delete reappears on next sync (tracked in 5.4).
+
+### Nice-to-have (can ship without; queue for v1.1)
+P3 UX differentiators and P4 code-quality refactors. None block a v1 release:
+- **4.4** Snooze + follow-up reminders
+- **4.5** Recipient autocomplete
+- **4.6** Smart bundles / grouping
+- **4.7** Per-account settings (signature, display name, aliases)
+- **4.8** Live theme sync
+- **5.4–5.6** Split InboxPage god-component, unify composer, dedup helpers
+
+### Suggested v1.1 priority
+1. 5.4 (split InboxPage) — unblocks faster iteration on the remaining P3 items; fixes the two latent bugs.
+2. 4.5 (autocomplete) + 4.7 (per-account settings) — highest user-value P3 items.
+3. 4.8 (live theme) — trivial, quick win.
+4. 4.4 (snooze) + 4.6 (bundles) — deeper UX polish.
 
 ---
 
