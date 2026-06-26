@@ -108,6 +108,8 @@ pub struct SendQueueItem {
     pub retry_count: i64,
     pub created_at: i64,
     pub sent_at: Option<i64>,
+    #[serde(default)]
+    pub send_after: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

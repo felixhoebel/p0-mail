@@ -1,6 +1,6 @@
 export type ProviderType = "gmail_oauth" | "microsoft_oauth" | "imap";
 export type EncryptionType = "SSL" | "STARTTLS";
-export type SendStatus = "pending" | "sent" | "failed";
+export type SendStatus = "pending" | "sending" | "sent" | "failed" | "draft";
 export type AiTone = "Professional" | "Friendly" | "Concise";
 export type AiOutputLanguage = "de" | "en" | "no";
 
@@ -96,6 +96,7 @@ export interface SendQueueItem {
   retry_count: number;
   created_at: number;
   sent_at: number | null;
+  send_after: number | null;
 }
 
 export interface AiConfig {

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { Loader2, Settings, Search, RefreshCw, Archive, Trash2, MailOpen, Mail, PenSquare, Reply, ReplyAll, Forward, CornerDownLeft, Sparkles, MessageSquare } from "lucide-react";
+import { Loader2, Settings, Search, RefreshCw, Archive, Trash2, MailOpen, Mail, PenSquare, Reply, ReplyAll, Forward, CornerDownLeft, Sparkles, MessageSquare, Clock } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -17,6 +17,7 @@ import {
   queueEmail,
   processSendQueue,
   cancelSend,
+  deleteDraft,
   getSendQueue,
   fetchEmailBody,
   fetchRecentBodies,
@@ -29,7 +30,7 @@ import {
   onMailSynced,
   onAiConfigChanged,
 } from "@/lib/api";
-import type { Account, Folder, Thread, Email, SendQueueItem, AiConfig, AiTone, AttachmentPayload } from "@/types";
+import type { Account, Folder, Thread, Email, SendQueueItem, EmailAddress, AiConfig, AiTone, AttachmentPayload } from "@/types";
 import EmailViewer from "@/components/email/EmailViewer";
 import ComposeEditor from "@/components/email/ComposeEditor";
 import VirtualizedThreadList from "@/components/email/VirtualizedThreadList";
@@ -67,13 +68,177 @@ function formatDate(ts: number): string {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-function SendQueuePanel({ onClose }: { onClose: () => void }) {
+function formatScheduleAt(ms: number): string {
+  const d = new Date(ms);
+  const now = new Date();
+  const isToday =
+    d.getDate() === now.getDate() &&
+    d.getMonth() === now.getMonth() &&
+    d.getFullYear() === now.getFullYear();
+  const time = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  if (isToday) return `today ${time}`;
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const isTomorrow =
+    d.getDate() === tomorrow.getDate() &&
+    d.getMonth() === tomorrow.getMonth() &&
+    d.getFullYear() === tomorrow.getFullYear();
+  if (isTomorrow) return `tomorrow ${time}`;
+  return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${time}`;
+}
+
+function isScheduledItem(i: SendQueueItem): boolean {
+  return i.status === "sending" && !!i.send_after && i.send_after * 1000 > Date.now() + 30000;
+}
+
+function countOutboxItems(items: SendQueueItem[]): number {
+  return items.filter((i) => i.status === "draft" || i.status === "pending" || isScheduledItem(i)).length;
+}
+
+function formatRecipients(addrs: EmailAddress[] | null): string {
+  if (!addrs || addrs.length === 0) return "(no recipients)";
+  return addrs.map((a) => a.name || a.address).join(", ");
+}
+
+function ScheduledView({
+  items,
+  accounts,
+  onCancel,
+  onEdit,
+  onRefresh,
+  refreshing,
+}: {
+  items: SendQueueItem[];
+  accounts: Account[];
+  onCancel: (id: number) => void;
+  onEdit: (item: SendQueueItem) => void;
+  onRefresh: () => void;
+  refreshing: boolean;
+}) {
+  const [cancelingId, setCancelingId] = useState<number | null>(null);
+
+  const handleCancel = async (id: number) => {
+    setCancelingId(id);
+    await onCancel(id);
+    setCancelingId(null);
+  };
+
+  const sorted = [...items].sort(
+    (a, b) => (a.send_after ?? 0) - (b.send_after ?? 0)
+  );
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex items-center justify-between px-5 py-2.5 border-b border-border shrink-0">
+        <div className="flex items-center gap-2">
+          <Clock className="h-4 w-4 text-muted-foreground" />
+          <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+            Scheduled
+          </h3>
+          {items.length > 0 && (
+            <span className="text-[10px] font-medium bg-blue-500/15 text-blue-600 px-1.5 rounded">
+              {items.length}
+            </span>
+          )}
+        </div>
+        <button
+          onClick={onRefresh}
+          disabled={refreshing}
+          className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
+        >
+          <RefreshCw className={`h-3 w-3 ${refreshing ? "animate-spin" : ""}`} />
+          Refresh
+        </button>
+      </div>
+
+      {sorted.length === 0 ? (
+        <div className="flex flex-col items-center justify-center flex-1 py-16 px-4 text-center">
+          <Clock className="h-6 w-6 text-muted-foreground/30 mb-3" />
+          <p className="text-sm text-muted-foreground">No scheduled emails</p>
+          <p className="text-xs text-muted-foreground/70 mt-1">
+            Use &ldquo;Send later&rdquo; in compose to schedule a message.
+          </p>
+        </div>
+      ) : (
+        <div className="flex-1 overflow-y-auto scrollbar-thin">
+          {sorted.map((item) => {
+            const account = accounts.find((a) => a.id === item.account_id);
+            const sendAtMs = item.send_after ? item.send_after * 1000 : 0;
+            const bodyPreview = item.body_text
+              ? item.body_text.replace(/\s+/g, " ").trim().slice(0, 160)
+              : "";
+            return (
+              <div
+                key={item.id}
+                className="px-5 py-3 border-b border-border hover:bg-accent/30 transition-colors"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <button
+                    type="button"
+                    onClick={() => onEdit(item)}
+                    className="flex-1 min-w-0 text-left cursor-pointer"
+                    title="Edit scheduled email"
+                  >
+                    <div className="flex items-center gap-2 mb-0.5">
+                      <p className="text-sm font-medium truncate">
+                        {item.subject || "(no subject)"}
+                      </p>
+                    </div>
+                    <p className="text-xs text-muted-foreground truncate">
+                      To: {formatRecipients(item.to)}
+                    </p>
+                    {bodyPreview && (
+                      <p className="text-xs text-muted-foreground/70 mt-1 line-clamp-2">
+                        {bodyPreview}
+                      </p>
+                    )}
+                    <div className="flex items-center gap-2 mt-1.5">
+                      <span className="text-[10px] text-blue-600 flex items-center gap-1">
+                        <Clock className="h-2.5 w-2.5" />
+                        {formatScheduleAt(sendAtMs)}
+                      </span>
+                      {account && (
+                        <>
+                          <span className="text-[10px] text-muted-foreground/40">·</span>
+                          <span className="text-[10px] text-muted-foreground">
+                            {account.email_address !== "unknown@unknown.com"
+                              ? account.email_address
+                              : account.display_name}
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => handleCancel(item.id)}
+                    disabled={cancelingId === item.id}
+                    className="shrink-0 text-[11px] text-muted-foreground hover:text-destructive transition-colors disabled:opacity-50 whitespace-nowrap"
+                  >
+                    {cancelingId === item.id ? "Canceling…" : "Cancel"}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SendQueuePanel({ onClose, onEdit, onQueueChange }: { onClose: () => void; onEdit: (item: SendQueueItem) => void; onQueueChange: () => void }) {
   const [items, setItems] = useState<SendQueueItem[]>([]);
   const [processing, setProcessing] = useState(false);
+  const [cancelingId, setCancelingId] = useState<number | null>(null);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
 
-  useEffect(() => {
+  const refresh = useCallback(() => {
     getSendQueue().then(setItems).catch(console.error);
   }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
 
   const handleProcess = async () => {
     setProcessing(true);
@@ -81,10 +246,39 @@ function SendQueuePanel({ onClose }: { onClose: () => void }) {
       await processSendQueue();
       const updated = await getSendQueue();
       setItems(updated);
+      onQueueChange();
     } catch (e) {
       console.error(e);
     } finally {
       setProcessing(false);
+    }
+  };
+
+  const handleCancel = async (queueId: number) => {
+    setCancelingId(queueId);
+    try {
+      await cancelSend(queueId);
+      const updated = await getSendQueue();
+      setItems(updated);
+      onQueueChange();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setCancelingId(null);
+    }
+  };
+
+  const handleDelete = async (queueId: number) => {
+    setDeletingId(queueId);
+    try {
+      await deleteDraft(queueId);
+      const updated = await getSendQueue();
+      setItems(updated);
+      onQueueChange();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -106,26 +300,79 @@ function SendQueuePanel({ onClose }: { onClose: () => void }) {
         <p className="text-xs text-muted-foreground">Queue is empty.</p>
       ) : (
         <div className="space-y-1 max-h-32 overflow-y-auto scrollbar-thin">
-          {items.map((item) => (
-            <div
-              key={item.id}
-              className="flex items-center justify-between text-xs rounded-md px-2.5 py-1.5 bg-background/50"
-            >
-              <span className="truncate flex-1">{item.subject}</span>
-              <span
-                className={`ml-2 px-1.5 rounded text-[10px] font-medium ${
-                  item.status === "sent"
-                    ? "text-emerald-600"
-                    : item.status === "failed"
-                      ? "text-destructive"
-                      : "text-amber-600"
-                }`}
+          {items.map((item) => {
+            const isScheduled = item.status === "sending" && item.send_after && item.send_after * 1000 > Date.now();
+            const editable = item.status === "draft" || isScheduled;
+            return (
+              <div
+                key={item.id}
+                className={`flex items-center justify-between text-xs rounded-md px-2.5 py-1.5 bg-background/50 ${editable ? "cursor-pointer hover:bg-accent/50" : ""}`}
+                onClick={() => {
+                  if (editable) onEdit(item);
+                }}
               >
-                {item.status}
-                {item.retry_count > 0 ? ` (${item.retry_count})` : ""}
-              </span>
-            </div>
-          ))}
+                <div className="flex flex-col min-w-0 flex-1">
+                  <span className="truncate">{item.subject || "(no subject)"}</span>
+                  {isScheduled && (
+                    <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+                      <Clock className="h-2.5 w-2.5" />
+                      {formatScheduleAt(item.send_after! * 1000)}
+                    </span>
+                  )}
+                  {item.status === "draft" && (
+                    <span className="text-[10px] text-muted-foreground/70">
+                      Click to edit
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-1.5 ml-2 shrink-0">
+                  {isScheduled && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleCancel(item.id);
+                      }}
+                      disabled={cancelingId === item.id}
+                      className="text-[10px] text-muted-foreground hover:text-destructive transition-colors disabled:opacity-50"
+                    >
+                      {cancelingId === item.id ? "…" : "Cancel"}
+                    </button>
+                  )}
+                  {item.status === "draft" && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDelete(item.id);
+                      }}
+                      disabled={deletingId === item.id}
+                      className="text-muted-foreground hover:text-destructive transition-colors disabled:opacity-50"
+                      title="Delete draft"
+                    >
+                      {deletingId === item.id ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-3 w-3" />
+                      )}
+                    </button>
+                  )}
+                  <span
+                    className={`px-1.5 rounded text-[10px] font-medium ${
+                      item.status === "sent"
+                        ? "text-emerald-600"
+                        : item.status === "failed"
+                          ? "text-destructive"
+                          : isScheduled
+                            ? "text-blue-600"
+                            : "text-amber-600"
+                    }`}
+                  >
+                    {isScheduled ? "scheduled" : item.status}
+                    {item.retry_count > 0 ? ` (${item.retry_count})` : ""}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -166,6 +413,7 @@ function InlineReplyEditor({
     bodyText: string;
     inReplyTo?: string;
     references?: string[];
+    sendAt?: number;
   }) => void;
   onCancel: () => void;
   sending?: boolean;
@@ -339,6 +587,8 @@ export default function InboxPage({ active }: { active: boolean }) {
   const [selectedAccount, setSelectedAccount] = useState<number | null>(null);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
+  const [view, setView] = useState<"inbox" | "scheduled">("inbox");
+  const [scheduledItems, setScheduledItems] = useState<SendQueueItem[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [selectedThread, setSelectedThread] = useState<number | null>(null);
   const [emails, setEmails] = useState<Email[]>([]);
@@ -362,6 +612,8 @@ export default function InboxPage({ active }: { active: boolean }) {
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [undoSend, setUndoSend] = useState<{ queueId: number; subject: string } | null>(null);
   const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [scheduledSend, setScheduledSend] = useState<{ queueId: number; subject: string; sendAt: number } | null>(null);
+  const scheduledTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [aiConfig, setAiConfig] = useState<AiConfig | null>(null);
 
   const [aiSummary, setAiSummary] = useState<string | null>(null);
@@ -387,6 +639,9 @@ export default function InboxPage({ active }: { active: boolean }) {
   const [composeBodyHtml, setComposeBodyHtml] = useState<string | undefined>();
   const [composeInReplyTo, setComposeInReplyTo] = useState<string | undefined>();
   const [composeReferences, setComposeReferences] = useState<string[] | undefined>();
+  const [composeBcc, setComposeBcc] = useState("");
+  const [composeDraftId, setComposeDraftId] = useState<number | undefined>();
+  const [composeScheduleAt, setComposeScheduleAt] = useState<number | undefined>();
 
   const [aiDraftBody, setAiDraftBody] = useState<string | null>(null);
   const [showChat, setShowChat] = useState(false);
@@ -442,13 +697,29 @@ export default function InboxPage({ active }: { active: boolean }) {
     };
   }, []);
 
+  const refreshScheduledItems = useCallback(() => {
+    getSendQueue()
+      .then((items) => {
+        setScheduledItems(items.filter(isScheduledItem));
+        setPendingQueueCount(countOutboxItems(items));
+      })
+      .catch(() => {
+        setScheduledItems([]);
+        setPendingQueueCount(0);
+      });
+  }, []);
+
   useEffect(() => {
     const refreshQueue = () => {
       getSendQueue()
-        .then((items) =>
-          setPendingQueueCount(items.filter((i) => i.status === "pending").length)
-        )
-        .catch(() => setPendingQueueCount(0));
+        .then((items) => {
+          setScheduledItems(items.filter(isScheduledItem));
+          setPendingQueueCount(countOutboxItems(items));
+        })
+        .catch(() => {
+          setPendingQueueCount(0);
+          setScheduledItems([]);
+        });
     };
     refreshQueue();
     if (online) {
@@ -510,6 +781,7 @@ export default function InboxPage({ active }: { active: boolean }) {
       setFolders([]);
     }
     setSelectedFolder(null);
+    setView("inbox");
   }, [selectedAccount]);
 
   useEffect(() => {
@@ -670,6 +942,7 @@ export default function InboxPage({ active }: { active: boolean }) {
   const handleSelectThread = async (thread: Thread) => {
     setSelectedThread(thread.id);
     selectedThreadRef.current = thread.id;
+    setView("inbox");
     clearAiState();
     setShowInlineReply(false);
     try {
@@ -763,6 +1036,39 @@ export default function InboxPage({ active }: { active: boolean }) {
     }
   }, [undoSend]);
 
+  const startScheduledToast = useCallback((queueId: number, subject: string, sendAt: number) => {
+    if (scheduledTimerRef.current) clearTimeout(scheduledTimerRef.current);
+    setScheduledSend({ queueId, subject, sendAt });
+    setStatusMessage(`Scheduled for ${formatScheduleAt(sendAt)}.`);
+    scheduledTimerRef.current = setTimeout(() => {
+      scheduledTimerRef.current = null;
+      setScheduledSend(null);
+    }, 10000);
+  }, []);
+
+  const handleCancelScheduled = useCallback(async () => {
+    const current = scheduledSend;
+    if (!current) return;
+    const { queueId, subject } = current;
+    if (scheduledTimerRef.current) {
+      clearTimeout(scheduledTimerRef.current);
+      scheduledTimerRef.current = null;
+    }
+    try {
+      const canceled = await cancelSend(queueId);
+      if (canceled) {
+        setStatusMessage(`"${subject || "(no subject)"}" — scheduled send canceled, saved to Drafts.`);
+      } else {
+        setStatusMessage("Couldn't cancel — message already sending.");
+      }
+      refreshScheduledItems();
+    } catch (e) {
+      setStatusMessage(String(e));
+    } finally {
+      setScheduledSend(null);
+    }
+  }, [scheduledSend, refreshScheduledItems]);
+
   const handleSend = async (params: {
     accountId: number;
     to: string;
@@ -774,10 +1080,22 @@ export default function InboxPage({ active }: { active: boolean }) {
     attachments?: AttachmentPayload[];
     inReplyTo?: string;
     references?: string[];
+    sendAt?: number;
   }) => {
     setSending(true);
     setStatusMessage(null);
     try {
+      if (params.sendAt) {
+        const deferSeconds = Math.max(1, Math.round((params.sendAt - Date.now()) / 1000));
+        const queueId = await queueEmail({
+          ...params,
+          deferSeconds,
+        });
+        closeComposeAfterSend();
+        startScheduledToast(queueId, params.subject, params.sendAt);
+        refreshScheduledItems();
+        return;
+      }
       if (online) {
         if (undoSend) {
           if (undoTimerRef.current) {
@@ -794,7 +1112,7 @@ export default function InboxPage({ active }: { active: boolean }) {
         await queueEmail(params);
         setStatusMessage("Offline — email queued for later.");
         const items = await getSendQueue();
-        setPendingQueueCount(items.filter((i) => i.status === "pending").length);
+        setPendingQueueCount(countOutboxItems(items));
         closeComposeAfterSend();
       }
     } catch (e) {
@@ -932,6 +1250,9 @@ export default function InboxPage({ active }: { active: boolean }) {
       setComposeBodyHtml(buildForwardBody(email));
       setComposeInReplyTo(undefined);
       setComposeReferences(undefined);
+      setComposeBcc("");
+      setComposeDraftId(undefined);
+      setComposeScheduleAt(undefined);
       setAiDraftBody(null);
       setShowInlineReply(false);
       setComposing(true);
@@ -946,10 +1267,44 @@ export default function InboxPage({ active }: { active: boolean }) {
     setComposeBodyHtml(undefined);
     setComposeInReplyTo(undefined);
     setComposeReferences(undefined);
+    setComposeBcc("");
+    setComposeDraftId(undefined);
+    setComposeScheduleAt(undefined);
     setAiDraftBody(null);
     setShowInlineReply(false);
     setComposing(true);
+    setView("inbox");
   }, []);
+
+  const handleEditQueueItem = useCallback(async (item: SendQueueItem) => {
+    const toStr = item.to.map((a) => a.address).filter(Boolean).join(", ");
+    const ccStr = item.cc?.map((a) => a.address).filter(Boolean).join(", ") ?? "";
+    const bccStr = item.bcc?.map((a) => a.address).filter(Boolean).join(", ") ?? "";
+    const wasSending = item.status === "sending";
+    const wasScheduled = isScheduledItem(item);
+    if (wasSending) {
+      try {
+        await cancelSend(item.id);
+      } catch (e) {
+        console.error(e);
+      }
+      refreshScheduledItems();
+    }
+    setComposeTo(toStr);
+    setComposeCc(ccStr);
+    setComposeBcc(bccStr);
+    setComposeSubject(item.subject || "");
+    setComposeBodyHtml(item.body_html ?? undefined);
+    setComposeInReplyTo(undefined);
+    setComposeReferences(undefined);
+    setComposeDraftId(item.id);
+    setComposeScheduleAt(wasScheduled && item.send_after ? item.send_after * 1000 : undefined);
+    setAiDraftBody(null);
+    setShowInlineReply(false);
+    setShowQueue(false);
+    setView("inbox");
+    setComposing(true);
+  }, [refreshScheduledItems]);
 
   const handleMarkAllRead = useCallback(async () => {
     try {
@@ -1106,6 +1461,9 @@ export default function InboxPage({ active }: { active: boolean }) {
     setComposeBodyHtml(body);
     setComposeInReplyTo(undefined);
     setComposeReferences(undefined);
+    setComposeBcc("");
+    setComposeDraftId(undefined);
+    setComposeScheduleAt(undefined);
     setAiDraftBody(null);
     setShowInlineReply(false);
     setComposing(true);
@@ -1121,6 +1479,9 @@ export default function InboxPage({ active }: { active: boolean }) {
     setComposeBodyHtml(plainTextToHtml(aiSummary));
     setComposeInReplyTo(undefined);
     setComposeReferences(undefined);
+    setComposeBcc("");
+    setComposeDraftId(undefined);
+    setComposeScheduleAt(undefined);
     setAiDraftBody(null);
     setShowInlineReply(false);
     setComposing(true);
@@ -1494,7 +1855,7 @@ export default function InboxPage({ active }: { active: boolean }) {
         {folders.length > 1 && (
           <div className="flex gap-1 px-2 py-1.5 border-b border-border overflow-x-auto scrollbar-none">
             <button
-              onClick={() => setSelectedFolder(null)}
+              onClick={() => { setSelectedFolder(null); setView("inbox"); }}
               className={`px-2 py-0.5 text-[11px] rounded-md whitespace-nowrap transition-colors ${
                 selectedFolder === null
                   ? "bg-foreground text-background"
@@ -1506,7 +1867,7 @@ export default function InboxPage({ active }: { active: boolean }) {
             {folders.map((folder) => (
               <button
                 key={folder.id}
-                onClick={() => setSelectedFolder(folder.imap_name)}
+                onClick={() => { setSelectedFolder(folder.imap_name); setView("inbox"); }}
                 className={`px-2 py-0.5 text-[11px] rounded-md whitespace-nowrap transition-colors ${
                   selectedFolder === folder.imap_name
                     ? "bg-foreground text-background"
@@ -1518,6 +1879,33 @@ export default function InboxPage({ active }: { active: boolean }) {
             ))}
           </div>
         )}
+
+        {/* Quick nav: Scheduled */}
+        <div className="border-b border-border px-2 py-1.5">
+          <button
+            onClick={() => {
+              if (view === "scheduled") {
+                setView("inbox");
+              } else {
+                setView("scheduled");
+                refreshScheduledItems();
+              }
+            }}
+            className={`flex items-center gap-2 w-full px-2 py-1 rounded-md text-xs transition-colors ${
+              view === "scheduled"
+                ? "bg-accent text-foreground"
+                : "text-muted-foreground hover:bg-accent/50"
+            }`}
+          >
+            <Clock className="h-3.5 w-3.5" />
+            <span>Scheduled</span>
+            {scheduledItems.length > 0 && (
+              <span className="ml-auto text-[10px] font-medium bg-blue-500/15 text-blue-600 px-1.5 rounded">
+                {scheduledItems.length}
+              </span>
+            )}
+          </button>
+        </div>
 
         {/* Thread items */}
         <div className="flex-1 overflow-y-auto scrollbar-thin flex flex-col">
@@ -1596,15 +1984,31 @@ export default function InboxPage({ active }: { active: boolean }) {
 
       {/* Reading pane / Compose */}
       <div className="flex-1 flex flex-col overflow-hidden bg-background">
-        {showQueue && <SendQueuePanel onClose={() => setShowQueue(false)} />}
+        {view === "scheduled" ? (
+          <ScheduledView
+            items={scheduledItems}
+            accounts={accounts}
+            onCancel={async (id) => {
+              await cancelSend(id);
+              refreshScheduledItems();
+            }}
+            onEdit={handleEditQueueItem}
+            onRefresh={refreshScheduledItems}
+            refreshing={false}
+          />
+        ) : (
+          <>
+        {showQueue && <SendQueuePanel onClose={() => setShowQueue(false)} onEdit={handleEditQueueItem} onQueueChange={refreshScheduledItems} />}
         {composing ? (
           <ComposeEditor
             accountId={selectedAccount || accounts[0]?.id || 0}
             to={composeTo}
             cc={composeCc}
-            bcc=""
+            bcc={composeBcc}
             subject={composeSubject}
             initialBodyHtml={composeBodyHtml ?? aiDraftBody ?? undefined}
+            draftId={composeDraftId}
+            initialScheduleAt={composeScheduleAt}
             inReplyTo={composeInReplyTo}
             references={composeReferences}
             aiEnabled={!!aiConfig && online}
@@ -1615,6 +2019,7 @@ export default function InboxPage({ active }: { active: boolean }) {
               setAiDraftBody(null);
               setComposeBodyHtml(undefined);
             }}
+            onDraftSaved={refreshScheduledItems}
             sending={sending}
           />
         ) : selectedEmailData ? (
@@ -1871,6 +2276,8 @@ export default function InboxPage({ active }: { active: boolean }) {
             </div>
           </div>
         )}
+          </>
+        )}
       </div>
 
       {ctxMenu.menu && (
@@ -1888,6 +2295,22 @@ export default function InboxPage({ active }: { active: boolean }) {
             className="font-medium underline underline-offset-2 hover:opacity-80 whitespace-nowrap"
           >
             Undo
+          </button>
+        </div>
+      )}
+
+      {scheduledSend && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2.5 rounded-lg bg-foreground px-4 py-2.5 shadow-lg text-background text-sm animate-in fade-in slide-in-from-bottom-2">
+          <Clock className="h-4 w-4 shrink-0 opacity-80" />
+          <span className="truncate max-w-[280px]">
+            &ldquo;{scheduledSend.subject || "(no subject)"}&rdquo; scheduled for {formatScheduleAt(scheduledSend.sendAt)}
+          </span>
+          <button
+            type="button"
+            onClick={handleCancelScheduled}
+            className="font-medium underline underline-offset-2 hover:opacity-80 whitespace-nowrap"
+          >
+            Cancel
           </button>
         </div>
       )}

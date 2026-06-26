@@ -1139,7 +1139,7 @@ async fn get_send_queue() -> Result<Vec<models::SendQueueItem>, String> {
             .prepare(
                 "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
                  body_html, body_text, attachments_meta, status, retry_count, \
-                 created_at, sent_at FROM send_queue ORDER BY created_at DESC",
+                 created_at, sent_at, send_after FROM send_queue ORDER BY created_at DESC",
             )
             .map_err(|e| e.to_string())?;
         let items: Vec<models::SendQueueItem> = stmt
@@ -1162,6 +1162,7 @@ async fn get_send_queue() -> Result<Vec<models::SendQueueItem>, String> {
                     retry_count: row.get(10)?,
                     created_at: row.get(11)?,
                     sent_at: row.get(12)?,
+                    send_after: row.get(13)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -1222,11 +1223,11 @@ async fn list_drafts(account_id: Option<i64>) -> Result<Vec<models::SendQueueIte
         let sql = match account_id {
             Some(_) => "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
                         body_html, body_text, attachments_meta, status, retry_count, \
-                        created_at, sent_at FROM send_queue WHERE status = 'draft' \
+                        created_at, sent_at, send_after FROM send_queue WHERE status = 'draft' \
                         AND account_id = ?1 ORDER BY updated_at DESC",
             None => "SELECT id, account_id, to_json, cc_json, bcc_json, subject, \
                      body_html, body_text, attachments_meta, status, retry_count, \
-                     created_at, sent_at FROM send_queue WHERE status = 'draft' \
+                     created_at, sent_at, send_after FROM send_queue WHERE status = 'draft' \
                      ORDER BY updated_at DESC",
         };
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -1277,6 +1278,7 @@ fn map_send_queue_row(row: &rusqlite::Row) -> rusqlite::Result<models::SendQueue
         retry_count: row.get(10)?,
         created_at: row.get(11)?,
         sent_at: row.get(12)?,
+        send_after: row.get(13)?,
     })
 }
 

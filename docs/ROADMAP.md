@@ -2,7 +2,7 @@
 
 > **Purpose.** Self-contained workstream specs for autonomous agents. Each task lists what to build, which files to touch, dependencies, and how to verify. Pick a phase → pick a task → execute end-to-end.
 
-**Current state:** Phase 1-3 complete (DB encrypted at rest, background polling, new-mail notifications, FTS5 search, CI signing, OAuth + IMAP + AI streaming, attachments, folders, drafts, reply-all/forward, virtualization, error boundary, sync health). Phase 4 in progress: 4.1 Command palette ✅, 4.9 AI summary workflow ✅, 4.2 Undo send ✅; remaining (snooze, schedule, autocomplete, bundles, per-account settings, live theme). Phase 5 (code-quality refactors: lib.rs/InboxPage god-modules) partially done (5.1-5.3 ✅; 5.4-5.6 pending). An audit found a few latent bugs in "complete" tasks (see 5.2 FTS bug ✅fixed, mark_read swallows IMAP errors, handleArchive/handleDelete swallow backend errors) — these are tracked in Phase 5.
+**Current state:** Phase 1-3 complete (DB encrypted at rest, background polling, new-mail notifications, FTS5 search, CI signing, OAuth + IMAP + AI streaming, attachments, folders, drafts, reply-all/forward, virtualization, error boundary, sync health). Phase 4 in progress: 4.1 Command palette ✅, 4.9 AI summary workflow ✅, 4.2 Undo send ✅, 4.3 Schedule send ✅; remaining (snooze, autocomplete, bundles, per-account settings, live theme). Phase 5 (code-quality refactors: lib.rs/InboxPage god-modules) partially done (5.1-5.3 ✅; 5.4-5.6 pending). An audit found a few latent bugs in "complete" tasks (see 5.2 FTS bug ✅fixed, mark_read swallows IMAP errors, handleArchive/handleDelete swallow backend errors) — these are tracked in Phase 5.
 
 **Conventions:** Conventional commits (`feat:`, `fix:`, `security:`, `chore:`). No comments unless asked. Rust in `src-tauri/src/`, React in `src/`. Verify with `cargo test` + `npm run build` (CI runs `tsc --noEmit` + build).
 
@@ -268,10 +268,18 @@ Driven by an architecture audit of the two largest files (`lib.rs` 1957 LOC, `In
 **Verify:** `cargo test` (20 passed, incl. new `migration_013_allows_draft_and_sending_status_and_adds_send_after`) + `cargo clippy` clean + `npm run build`/`tsc` clean. Manual: send an email → toast appears → click Undo within 8s → message lands in Drafts; otherwise it sends and appears in Sent.
 **Depends on:** 2.3 (drafts). **Unblocks:** 4.3 (same queue + `send_after` infra).
 
-### 4.3 Schedule send
+### 4.3 Schedule send ✅ COMPLETE
 **Spec:** Compose has "Send later" → datetime picker. Queue with `send_after = <ts>`. Background poller (1min) sends when due.
-**Files:** `src-tauri/src/compose/mod.rs`, `src-tauri/migrations` (`send_queue.send_after INTEGER`), `src/components/email/ComposeEditor.tsx`.
-**Depends on:** 4.2 (same queue infra).
+**Implementation:**
+- Backend infra was already complete from 4.2: `queue_email` accepts `defer_seconds: Option<i64>` → `send_after = now + secs` (status `sending`); `process_queue` only sends items where `send_after IS NULL OR send_after <= now`; the 60s poll loop calls `process_queue()` each cycle as a backstop. So scheduling a future send needs no new backend logic — just a larger `defer_seconds`.
+- Exposed `send_after: Option<i64>` on `SendQueueItem` (model + `get_send_queue`/`list_drafts` SELECTs + `map_send_queue_row`) so the UI can show when a scheduled send fires. Frontend `SendQueueItem` type gained `send_after`; also fixed latent `SendStatus` type to include `sending`/`draft` (added by 4.2 but never reflected in the TS type).
+- `ComposeEditor`: "Send later" button (Clock icon) in the footer toolbar opens a popover with a native `<input type="datetime-local">` (min = now+30s) plus quick presets (In 1 hour, Tonight 8pm, Tomorrow 9am, Mon 9am). Confirming calls `onSend` with a new optional `sendAt` (ms epoch).
+- `InboxPage.handleSend`: when `params.sendAt` is set, computes `deferSeconds = (sendAt - now)/1000` and queues via `queueEmail` (skipping the 8s undo window), then shows a fixed-bottom "scheduled for <time> — Cancel" toast (10s). Cancel calls the existing `cancel_send` command (flips `sending`→`draft`, saved to Drafts).
+- `SendQueuePanel` (Outbox): items with `status='sending'` + future `send_after` render as "scheduled" with the formatted time + a per-row Cancel button. The Outbox badge now counts pending + scheduled sends (30s threshold excludes the 8s undo-window items), so scheduled sends remain reachable for cancellation after the toast dismisses.
+- Dedicated "Scheduled" view: a "Scheduled" nav entry in the sidebar (Clock icon + count badge) opens a full-page `ScheduledView` in the reading pane, showing all scheduled sends sorted by send time with recipient, subject, body preview, formatted due time, account, and per-row Cancel. Selecting a thread, folder, account, or Compose resets to inbox view.
+**Files:** `src-tauri/src/commands/models.rs`, `src-tauri/src/lib.rs`, `src/components/email/ComposeEditor.tsx`, `src/pages/InboxPage.tsx`, `src/types/index.ts`.
+**Verify:** `cargo test` (20 passed) + `cargo clippy` (no new warnings) + `npm run build`/`tsc` clean. Manual: Compose → "Send later" → pick a time → toast "scheduled for …" → cancel returns it to Drafts; otherwise the 60s poller sends when due and it lands in Sent.
+**Depends on:** 4.2 (same queue + `send_after` infra).
 
 ### 4.4 Snooze + follow-up reminders
 **Spec:** Snooze thread to datetime → hide from inbox → resurface at time. Follow-up nudge: if no reply in thread after N days, surface reminder. All local, no server side.
@@ -320,7 +328,7 @@ Four actions on the summary panel, shown as a button row beneath the summary tex
 
 ```
 1.3 SQLCipher ─┬─► 1.1 Poll loop ─┬─► 1.2 Notifications ✅
-               │                  ├─► 2.2 Folders ─► 2.3 Drafts ─► 4.2 Undo send ✅ ─► 4.3 Schedule
+               │                  ├─► 2.2 Folders ─► 2.3 Drafts ─► 4.2 Undo send ✅ ─► 4.3 Schedule ✅
                │                  └─► 4.4 Snooze/reminders
 1.4 FTS fix ─────────────────────► ✅ (independent)
 1.5 CI signing ───────────────────► ✅ (parallel infra)
@@ -363,7 +371,7 @@ When picking up a task:
 - [x] 3.5 Input validation
 - [x] 4.1 Command palette
 - [x] 4.2 Undo send
-- [ ] 4.3 Schedule send
+- [x] 4.3 Schedule send
 - [ ] 4.4 Snooze/reminders
 - [ ] 4.5 Autocomplete
 - [ ] 4.6 Smart bundles

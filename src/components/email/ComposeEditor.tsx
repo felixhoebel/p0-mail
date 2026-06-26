@@ -1,7 +1,7 @@
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { useCallback, useState, useEffect, useRef } from "react";
-import { Sparkles, X, CornerDownLeft, Paperclip, Check } from "lucide-react";
+import { Sparkles, X, CornerDownLeft, Paperclip, Check, Clock, CalendarClock } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { AiTone, AttachmentPayload } from "@/types";
@@ -16,6 +16,7 @@ interface ComposeEditorProps {
   subject: string;
   initialBodyHtml?: string;
   draftId?: number;
+  initialScheduleAt?: number;
   inReplyTo?: string;
   references?: string[];
   aiEnabled?: boolean;
@@ -31,8 +32,10 @@ interface ComposeEditorProps {
     attachments?: AttachmentPayload[];
     inReplyTo?: string;
     references?: string[];
+    sendAt?: number;
   }) => void;
   onCancel: () => void;
+  onDraftSaved?: (draftId: number) => void;
   sending?: boolean;
 }
 
@@ -44,12 +47,14 @@ export default function ComposeEditor({
   subject: initialSubject,
   initialBodyHtml,
   draftId: initialDraftId,
+  initialScheduleAt,
   inReplyTo,
   references,
   aiEnabled,
   aiTone = "Professional",
   onSend,
   onCancel,
+  onDraftSaved,
   sending,
 }: ComposeEditorProps) {
   const [to, setTo] = useState(initialTo);
@@ -61,6 +66,17 @@ export default function ComposeEditor({
   const [attachments, setAttachments] = useState<AttachmentPayload[]>([]);
   const [draftId, setDraftId] = useState<number | undefined>(initialDraftId);
   const [draftSaved, setDraftSaved] = useState(false);
+  const [showSchedule, setShowSchedule] = useState(
+    !!initialScheduleAt && initialScheduleAt > Date.now(),
+  );
+  const [scheduleAt, setScheduleAt] = useState<string>(() => {
+    if (initialScheduleAt && initialScheduleAt > Date.now()) {
+      const d = new Date(initialScheduleAt);
+      const pad = (n: number) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+    return "";
+  });
   const toRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -107,6 +123,52 @@ export default function ComposeEditor({
   const removeAttachment = useCallback((index: number) => {
     setAttachments((prev) => prev.filter((_, i) => i !== index));
   }, []);
+
+  const toLocalDatetimeInput = (d: Date): string => {
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+
+  const openScheduler = useCallback(() => {
+    const next = new Date(Date.now() + 60 * 60 * 1000);
+    next.setMinutes(0, 0, 0);
+    setScheduleAt(toLocalDatetimeInput(next));
+    setShowSchedule(true);
+  }, []);
+
+  const applyPreset = useCallback((ms: number) => {
+    setScheduleAt(toLocalDatetimeInput(new Date(ms)));
+  }, []);
+
+  const handleScheduleSend = useCallback(() => {
+    if (!editor) return;
+    const ts = new Date(scheduleAt).getTime();
+    if (!ts || Number.isNaN(ts)) return;
+    const minTs = Date.now() + 30 * 1000;
+    if (ts < minTs) {
+      setScheduleAt(toLocalDatetimeInput(new Date(minTs)));
+      return;
+    }
+    const bodyHtml = editor.getHTML();
+    const bodyText = editor.getText();
+    if (draftId) {
+      deleteDraft(draftId).catch(console.error);
+    }
+    onSend({
+      accountId,
+      to,
+      cc,
+      bcc,
+      subject,
+      bodyHtml,
+      bodyText,
+      attachments: attachments.length > 0 ? attachments : undefined,
+      inReplyTo,
+      references,
+      sendAt: ts,
+    });
+    setShowSchedule(false);
+  }, [editor, accountId, to, cc, bcc, subject, attachments, inReplyTo, references, onSend, draftId, scheduleAt]);
 
   const handleSend = useCallback(() => {
     if (!editor) return;
@@ -155,6 +217,7 @@ export default function ComposeEditor({
         });
         setDraftId(id);
         setDraftSaved(true);
+        onDraftSaved?.(id);
         if (draftSavedTimerRef.current) clearTimeout(draftSavedTimerRef.current);
         draftSavedTimerRef.current = setTimeout(() => setDraftSaved(false), 2000);
       } catch (e) {
@@ -306,7 +369,7 @@ export default function ComposeEditor({
       )}
 
       {/* Footer toolbar */}
-      <div className="flex items-center gap-2 px-5 py-2 border-t border-border shrink-0">
+      <div className="relative flex items-center gap-2 px-5 py-2 border-t border-border shrink-0">
         <input
           ref={fileInputRef}
           type="file"
@@ -323,6 +386,81 @@ export default function ComposeEditor({
           <Paperclip className="h-4 w-4" />
           Attach
         </button>
+        <button
+          onClick={openScheduler}
+          disabled={sending || aiBusy || !to}
+          className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
+          title="Schedule send"
+        >
+          <Clock className="h-4 w-4" />
+          Send later
+        </button>
+
+        {showSchedule && (
+          <div className="absolute bottom-full left-3 mb-2 z-20 w-72 rounded-lg border border-border bg-popover shadow-lg p-3 space-y-2.5 animate-in fade-in slide-in-from-bottom-1">
+            <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
+              <CalendarClock className="h-3.5 w-3.5" />
+              Schedule send
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {(() => {
+                const now = Date.now();
+                const presets: { label: string; ms: number }[] = [];
+                const in1h = now + 60 * 60 * 1000;
+                presets.push({ label: "In 1 hour", ms: in1h });
+                const tonight = new Date();
+                tonight.setHours(20, 0, 0, 0);
+                if (tonight.getTime() <= now) tonight.setDate(tonight.getDate() + 1);
+                presets.push({ label: "Tonight 8pm", ms: tonight.getTime() });
+                const tomorrow = new Date();
+                tomorrow.setDate(tomorrow.getDate() + 1);
+                tomorrow.setHours(9, 0, 0, 0);
+                presets.push({ label: "Tomorrow 9am", ms: tomorrow.getTime() });
+                const monday = new Date();
+                const dow = monday.getDay();
+                const daysUntilMon = ((1 + 7 - dow) % 7) || 7;
+                monday.setDate(monday.getDate() + daysUntilMon);
+                monday.setHours(9, 0, 0, 0);
+                presets.push({ label: "Mon 9am", ms: monday.getTime() });
+                return presets.map((p) => (
+                  <button
+                    key={p.label}
+                    onClick={() => applyPreset(p.ms)}
+                    className="rounded-md border border-border bg-background px-2 py-1 text-[10px] text-muted-foreground hover:text-foreground hover:border-foreground/30 transition-colors"
+                  >
+                    {p.label}
+                  </button>
+                ));
+              })()}
+            </div>
+            <input
+              type="datetime-local"
+              value={scheduleAt}
+              onChange={(e) => setScheduleAt(e.target.value)}
+              min={toLocalDatetimeInput(new Date(Date.now() + 30 * 1000))}
+              className="w-full h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground focus-visible:outline-none focus-visible:border-foreground/40"
+            />
+            <div className="flex justify-end gap-1.5 pt-0.5">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setShowSchedule(false)}
+                className="h-7 text-xs"
+              >
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                onClick={handleScheduleSend}
+                disabled={!scheduleAt}
+                className="h-8 text-xs gap-1.5"
+              >
+                <Clock className="h-3 w-3" />
+                Schedule
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
